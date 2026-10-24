@@ -72,16 +72,22 @@ class EventIn(BaseModel):
     tags: list[str] = Field(default_factory=list, max_length=30)
     client_ip: str | None = Field(default=None, max_length=64)
 
-def classify(event_type: str, path: str) -> str:
+def classify(event_type: str, path: str, tags: list[str] | None = None) -> str:
     p = path.lower()
+    tag_set = set(tags or [])
     if event_type == "fake_shell_access":
         return "decoy_access"
     if event_type == "login_attempt":
         return "password_attempt"
-    if any(x in p for x in ("/admin", "/dashboard", "wp-login", "wp-admin", "/.env", "phpmyadmin", "/config", "/backup")):
-        return "admin_probe"
     if event_type == "server_error":
         return "server_error"
+    # UA labels are self-reported and spoofable; these categories are heuristic.
+    if "ua_claim:search_crawler" in tag_set:
+        return "search_crawler"
+    if "assessment:scanner_like" in tag_set:
+        return "scanner_like"
+    if any(x in p for x in ("/admin", "/dashboard", "wp-login", "wp-admin", "/.env", "phpmyadmin", "/config", "/backup")):
+        return "admin_probe"
     if event_type == "http_request" and path != "/health":
         return "knock"
     return "request"
@@ -192,7 +198,7 @@ async def recent_events(limit: int = 50):
             "id": r["id"],
             "timestamp": r["occurred_at"].isoformat(),
             "event_type": r["event_type"],
-            "category": classify(r["event_type"], r["path"]),
+            "category": classify(r["event_type"], r["path"], r["tags"]),
             "method": r["method"],
             "path": r["path"],
             "status_code": r["status_code"],
@@ -251,8 +257,8 @@ section{margin-top:28px}.sectionhead{display:flex;align-items:baseline;justify-c
 let mapProjection=null;
 async function initWorldMap(){try{const r=await fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json",{cache:"force-cache"});if(!r.ok)throw Error("map data");const world=await r.json();const features=topojson.feature(world,world.objects.countries).features;mapProjection=d3.geoNaturalEarth1().fitExtent([[12,12],[988,488]],{type:"FeatureCollection",features});const path=d3.geoPath(mapProjection);const land=document.getElementById("world-land");land.replaceChildren();for(const feature of features){const p=document.createElementNS("http://www.w3.org/2000/svg","path");p.setAttribute("d",path(feature));p.setAttribute("class","land");land.append(p)}const borders=document.getElementById("country-borders");borders.setAttribute("d",path(topojson.mesh(world,world.objects.countries,(a,b)=>a!==b)));}catch(e){document.getElementById("worldmap").setAttribute("aria-label","世界地図データを読み込めませんでした。アクセス地点のみ表示します。")}}
 const fmtTime=s=>{try{return new Date(s).toISOString().replace('T',' ').slice(0,19)}catch{return s||'—'}};
-const label=c=>({http_request:'ノック / HTTP',login_attempt:'パスワード試行',server_error:'サーバーエラー',admin_probe:'管理画面探索',password_attempt:'パスワード試行',knock:'ノック / HTTP',request:'リクエスト'}[c]||c);
-const badge=c=>c==='login_attempt'||c==='password_attempt'?'warn':c==='server_error'||c==='admin_probe'?'fail':'';
+const label=c=>({http_request:'ノック / HTTP',login_attempt:'パスワード試行',server_error:'サーバーエラー',admin_probe:'管理画面探索',password_attempt:'パスワード試行',knock:'ノック / HTTP',request:'リクエスト',search_crawler:'検索クローラー候補',scanner_like:'スキャナー候補'}[c]||c);
+const badge=c=>c==='login_attempt'||c==='password_attempt'||c==='search_crawler'?'warn':c==='server_error'||c==='admin_probe'||c==='scanner_like'?'fail':'';
 function project(lon,lat){if(mapProjection){const q=mapProjection([lon,lat]);return {x:q[0],y:q[1]}}return {x:(lon+180)/360*1000,y:(90-lat)/180*500}}
 async function refreshGeo(){try{
  const r=await fetch('/api/dashboard/geo',{cache:'no-store'});if(!r.ok)throw Error('geo api');
