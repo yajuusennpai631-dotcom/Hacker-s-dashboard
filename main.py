@@ -25,16 +25,19 @@ CREATE TABLE IF NOT EXISTS events (
   geo_country TEXT,
   geo_city TEXT,
   geo_lat DOUBLE PRECISION,
-  geo_lon DOUBLE PRECISION
+  geo_lon DOUBLE PRECISION,
+  response_ms DOUBLE PRECISION
 );
 ALTER TABLE events ADD COLUMN IF NOT EXISTS geo_country TEXT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS geo_city TEXT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS geo_lat DOUBLE PRECISION;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS geo_lon DOUBLE PRECISION;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS response_ms DOUBLE PRECISION;
 CREATE INDEX IF NOT EXISTS events_occurred_at_idx ON events (occurred_at DESC);
 CREATE INDEX IF NOT EXISTS events_type_idx ON events (event_type);
 CREATE INDEX IF NOT EXISTS events_path_idx ON events (path);
 CREATE INDEX IF NOT EXISTS events_status_idx ON events (status_code);
+CREATE INDEX IF NOT EXISTS events_method_time_idx ON events (method, occurred_at DESC);
 """
 
 async def open_pool():
@@ -73,11 +76,15 @@ class EventIn(BaseModel):
     status_code: int = Field(default=200, ge=100, le=599)
     tags: list[str] = Field(default_factory=list, max_length=30)
     client_ip: str | None = Field(default=None, max_length=64)
+    response_ms: float | None = Field(default=None, ge=0, le=120000)
 
 PUBLIC_TAGS = {
     "ua_claim:search_crawler", "ua_claim:scanner_tool", "ua_claim:automation",
     "signal:exploit_probe", "signal:common_scan_path", "signal:non_read_method",
     "assessment:scanner_like",
+    "payload:sql_injection_candidate", "payload:path_traversal_candidate",
+    "payload:xss_candidate", "payload:command_injection_candidate",
+    "payload:sensitive_path_candidate",
 }
 
 def classify(event_type: str, path: str, tags: list[str] | None = None) -> str:
@@ -134,10 +141,10 @@ async def ingest(event: EventIn, authorization: str | None = Header(default=None
     async with app.state.pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO events
-               (occurred_at, event_type, method, path, status_code, tags, geo_country, geo_city, geo_lat, geo_lon)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
+               (occurred_at, event_type, method, path, status_code, tags, geo_country, geo_city, geo_lat, geo_lon, response_ms)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)""",
             occurred_at, event.event[:50], event.method[:12], path, event.status_code, tags,
-            country, city, lat, lon
+            country, city, lat, lon, event.response_ms
         )
     return {"accepted": True}
 
@@ -268,6 +275,64 @@ async def analytics():
               AND occurred_at < NOW() - INTERVAL '5 minutes') AS previous
           FROM events WHERE path <> '/health'
         """)
+
+        methods = await conn.fetch("""
+          SELECT method, COUNT(*) AS count
+          FROM events WHERE occurred_at >= NOW() - INTERVAL '24 hours' AND path <> '/health'
+          GROUP BY method ORDER BY count DESC LIMIT 10
+        """)
+        status_families = await conn.fetch("""
+          SELECT (status_code / 100)::text || 'xx' AS family, COUNT(*) AS count
+          FROM events WHERE occurred_at >= NOW() - INTERVAL '24 hours' AND path <> '/health'
+          GROUP BY status_code / 100 ORDER BY status_code / 100
+        """)
+        latency = await conn.fetchrow("""
+          SELECT COUNT(response_ms) AS samples,
+                 percentile_cont(0.50) WITHIN GROUP (ORDER BY response_ms) AS p50,
+                 percentile_cont(0.95) WITHIN GROUP (ORDER BY response_ms) AS p95,
+                 MAX(response_ms) AS max_ms
+          FROM events WHERE occurred_at >= NOW() - INTERVAL '24 hours'
+            AND path <> '/health' AND response_ms IS NOT NULL
+        """)
+        payload_signals = await conn.fetch("""
+          SELECT signal, COUNT(*) AS count FROM (
+            SELECT unnest(tags) AS signal FROM events
+            WHERE occurred_at >= NOW() - INTERVAL '24 hours' AND path <> '/health'
+          ) s
+          WHERE signal IN (
+            'payload:sql_injection_candidate','payload:path_traversal_candidate',
+            'payload:xss_candidate','payload:command_injection_candidate',
+            'payload:sensitive_path_candidate'
+          )
+          GROUP BY signal ORDER BY count DESC
+        """)
+        daily_30d = await conn.fetch("""
+          SELECT buckets.day AS day, COUNT(e.id) AS total,
+                 COUNT(e.id) FILTER (WHERE e.status_code >= 500) AS errors,
+                 COUNT(e.id) FILTER (WHERE 'assessment:scanner_like' = ANY(e.tags)) AS scanner_candidates
+          FROM generate_series(
+            date_trunc('day', NOW()) - INTERVAL '29 days',
+            date_trunc('day', NOW()), INTERVAL '1 day'
+          ) AS buckets(day)
+          LEFT JOIN events e ON e.occurred_at >= buckets.day
+            AND e.occurred_at < buckets.day + INTERVAL '1 day'
+            AND e.path <> '/health'
+          GROUP BY buckets.day ORDER BY buckets.day
+        """)
+        country_counts_7d = await conn.fetch("""
+          SELECT geo_country AS country, COUNT(*) AS count
+          FROM events WHERE geo_country IS NOT NULL
+            AND occurred_at >= NOW() - INTERVAL '7 days' AND path <> '/health'
+          GROUP BY geo_country ORDER BY count DESC LIMIT 10
+        """)
+        behavior = await conn.fetch("""
+          SELECT COUNT(*) FILTER (WHERE 'signal:non_read_method' = ANY(tags)) AS non_read_methods,
+                 COUNT(*) FILTER (WHERE 'signal:common_scan_path' = ANY(tags)) AS common_scan_paths,
+                 COUNT(*) FILTER (WHERE 'signal:exploit_probe' = ANY(tags)) AS exploit_candidates,
+                 COUNT(*) FILTER (WHERE status_code BETWEEN 400 AND 499) AS client_errors,
+                 COUNT(*) FILTER (WHERE status_code BETWEEN 500 AND 599) AS server_errors
+          FROM events WHERE occurred_at >= NOW() - INTERVAL '24 hours' AND path <> '/health'
+        """)
         totals = await conn.fetchrow("""
           SELECT
             COUNT(*) FILTER (WHERE occurred_at >= NOW() - INTERVAL '1 hour') AS last_hour,
@@ -281,6 +346,13 @@ async def analytics():
         "categories": [{"category": r["category"], "count": r["count"]} for r in categories],
         "top_paths": [{"path": r["path"], "count": r["count"]} for r in paths],
         "statuses": [{"status_code": r["status_code"], "count": r["count"]} for r in statuses],
+        "methods": [{"method": r["method"], "count": r["count"]} for r in methods],
+        "status_families": [{"family": r["family"], "count": r["count"]} for r in status_families],
+        "latency": {"samples": latency["samples"], "p50_ms": round(float(latency["p50"]), 2) if latency["p50"] is not None else None, "p95_ms": round(float(latency["p95"]), 2) if latency["p95"] is not None else None, "max_ms": round(float(latency["max_ms"]), 2) if latency["max_ms"] is not None else None},
+        "payload_signals": [{"signal": r["signal"], "count": r["count"]} for r in payload_signals],
+        "daily_30d": [{"day": r["day"].date().isoformat(), "total": r["total"], "errors": r["errors"], "scanner_candidates": r["scanner_candidates"]} for r in daily_30d],
+        "country_counts_7d": [{"country": r["country"], "count": r["count"]} for r in country_counts_7d],
+        "behavior": {k: int(behavior[k] or 0) for k in ("non_read_methods", "common_scan_paths", "exploit_candidates", "client_errors", "server_errors")},
         "last_hour": totals["last_hour"],
         "errors_24h": totals["errors_24h"],
         "scanner_candidates_24h": totals["scanner_candidates_24h"],
@@ -355,7 +427,7 @@ async def recent_events(limit: int = 50):
     limit = max(1, min(limit, 100))
     async with app.state.pool.acquire() as conn:
         rows = await conn.fetch("""
-          SELECT id, occurred_at, event_type, method, path, status_code, tags
+          SELECT id, occurred_at, event_type, method, path, status_code, tags, response_ms
           FROM events WHERE path <> '/health' ORDER BY occurred_at DESC LIMIT $1
         """, limit)
     result = []
@@ -368,6 +440,7 @@ async def recent_events(limit: int = 50):
             "method": r["method"],
             "path": r["path"],
             "status_code": r["status_code"],
+            "response_ms": round(float(r["response_ms"]), 2) if r["response_ms"] is not None else None,
             "tags": [tag for tag in r["tags"] if tag in PUBLIC_TAGS],
         })
     return {"events": result}
@@ -433,6 +506,29 @@ section{margin-top:28px}.sectionhead{display:flex;align-items:baseline;justify-c
 <div class="card"><div class="hint">時間帯ごとのイベント数を表示します。個別訪問者の追跡やアクセスの因果関係を示すものではありません。</div><div id="timelineBars" class="timeline-bars" role="img" aria-label="10分ごとのイベント数"></div><div class="timeline-legend"><span>■ アクセス数</span><span id="timelineTotal">合計 — 件</span></div><div id="timelineList" class="timeline" style="margin-top:12px"><div class="empty">タイムラインを読み込んでいます…</div></div></div></section>
 <section><div class="sectionhead"><h2>脅威シグナル分析</h2><span class="small">直近24時間 · ヒューリスティック</span></div>
 <div class="card"><div id="threatSignalList" class="rank-list"><div class="empty">シグナルを集計しています…</div></div><div class="signal-explain">シグナルは観測されたパス、HTTPメソッド、保存済みの分類タグに基づく候補です。User-Agentの申告は偽装可能であり、攻撃者の身元、意図、侵入成功を証明しません。</div></div></section>
+
+<section><div class="sectionhead"><h2>HTTP・通信観測</h2><span class="small">直近24時間 · Honeypot計測</span></div>
+<div class="grid" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+<div class="card"><div class="label">応答時間 P50</div><div class="value" id="latencyP50">—</div><div class="hint">記録済みリクエストの中央値</div></div>
+<div class="card"><div class="label">応答時間 P95</div><div class="value" id="latencyP95">—</div><div class="hint">95パーセンタイル</div></div>
+<div class="card"><div class="label">応答時間 最大</div><div class="value" id="latencyMax">—</div><div class="hint" id="latencySamples">計測サンプル —</div></div>
+</div>
+<div class="analytics-grid" style="margin-top:14px">
+<div class="card"><h2>HTTPメソッド</h2><div id="methodRanking" class="rank-list"></div></div>
+<div class="card"><h2>ステータス分類</h2><div id="statusFamilyRanking" class="rank-list"></div></div>
+</div>
+<div class="hint" style="margin-top:8px">応答時間はアプリケーションのリクエスト処理にかかった概算値で、クライアントから見た全ネットワーク遅延ではありません。</div>
+</section>
+<section><div class="sectionhead"><h2>不審ペイロード分類</h2><span class="small">直近24時間 · 内容は保存・公開しない</span></div>
+<div class="analytics-grid">
+<div class="card"><div id="payloadRanking" class="rank-list"></div><div class="signal-explain">SQLインジェクション、パストラバーサル、XSS、コマンド注入、機密パス探索のパターン候補を集計。文字列そのものやリクエスト本文は記録・表示しません。</div></div>
+<div class="card"><h2>行動シグナル</h2><div id="behaviorRanking" class="rank-list"></div><div class="signal-explain">集計は観測したリクエストの分類に基づきます。スキャンの意図や侵入成功を断定しません。</div></div>
+</div></section>
+<section><div class="sectionhead"><h2>長期傾向・地域別推移</h2><span class="small">直近30日 / 地域集計は7日間</span></div>
+<div class="analytics-grid">
+<div class="card"><div id="dailyBars" class="timeline-bars" style="height:90px"></div><div class="timeline-legend"><span>■ 日別アクセス</span><span id="dailyTotal">合計 — 件</span></div><div class="hint" style="margin-top:8px">横棒は各日の相対的なアクセス量です。30日分を集計。</div></div>
+<div class="card"><h2>国・地域別（7日間）</h2><div id="countryTrend" class="rank-list"></div><div class="signal-explain">IPから解決した概算地域。位置情報が得られないアクセスは含まれません。</div></div>
+</div></section>
 <section><div class="sectionhead"><h2>侵入状況</h2><span class="small">判定の限界</span></div><div class="card"><div class="value amber" style="font-size:20px">実侵入：判定対象外</div><div class="hint" id="intrusionNote">この囮アプリは本物の内部システムを公開していないため、実侵入の成功を判定できません。</div></div></section>
 <section><div class="sectionhead"><h2>アクセス元マップ</h2><span class="small">約10度単位の集約位置・5秒ごとに更新</span></div>
 <div class="maplayout"><div class="mapbox"><svg id="worldmap" viewBox="0 0 1000 500" role="img" aria-label="アクセス元の概算位置を示す世界地図">
@@ -468,11 +564,15 @@ function renderCategories(items){const root=document.getElementById('categoryLis
 function renderTrend(series){const W=760,H=250,left=38,right=16,top=18,bottom=36,plotW=W-left-right,plotH=H-top-bottom;const vals=series.map(x=>Number(x.total)||0),max=Math.max(4,...vals);const pts=series.map((x,i)=>({x:left+(series.length<2?0:i*plotW/(series.length-1)),y:top+plotH-(Number(x.total)||0)/max*plotH,v:Number(x.total)||0}));const grid=document.getElementById('trendGrid');grid.replaceChildren();for(let i=0;i<=4;i++){const y=top+i*plotH/4;const line=document.createElementNS('http://www.w3.org/2000/svg','line');line.setAttribute('x1',left);line.setAttribute('x2',W-right);line.setAttribute('y1',y);line.setAttribute('y2',y);line.setAttribute('class','chart-grid');grid.append(line);const t=document.createElementNS('http://www.w3.org/2000/svg','text');t.setAttribute('x',left-8);t.setAttribute('y',y+4);t.setAttribute('text-anchor','end');t.setAttribute('class','chart-label');t.textContent=Math.round(max*(4-i)/4);grid.append(t)}const poly=pts.map(p=>p.x+','+p.y).join(' ');document.getElementById('trendLine').setAttribute('points',poly);document.getElementById('trendArea').setAttribute('d',pts.length?'M '+pts[0].x+' '+(top+plotH)+' L '+pts.map(p=>p.x+' '+p.y).join(' L ')+' L '+pts[pts.length-1].x+' '+(top+plotH)+' Z':'');const pg=document.getElementById('trendPoints');pg.replaceChildren();for(let i=0;i<pts.length;i++){const p=pts[i];const dot=document.createElementNS('http://www.w3.org/2000/svg','circle');dot.setAttribute('cx',p.x);dot.setAttribute('cy',p.y);dot.setAttribute('r','3');dot.setAttribute('fill','#d7fbff');const title=document.createElementNS('http://www.w3.org/2000/svg','title');title.textContent=fmtTime(series[i].hour)+' UTC · '+p.v+' events';dot.append(title);pg.append(dot)}const labels=document.getElementById('trendLabels');labels.replaceChildren();for(const i of [0,Math.floor((series.length-1)/3),Math.floor(2*(series.length-1)/3),series.length-1]){if(!series[i])continue;const t=document.createElementNS('http://www.w3.org/2000/svg','text');t.setAttribute('x',pts[i].x);t.setAttribute('y',H-10);t.setAttribute('text-anchor',i===0?'start':i===series.length-1?'end':'middle');t.setAttribute('class','chart-label');t.textContent=new Date(series[i].hour).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit',timeZone:'UTC'});labels.append(t)}const total=vals.reduce((a,b)=>a+b,0);document.getElementById('trendHint').textContent='直近24時間の合計 '+total.toLocaleString()+' 件 · 時刻はUTC表示';}
 
 function renderTimeline(items){const bars=document.getElementById('timelineBars'),list=document.getElementById('timelineList');bars.replaceChildren();list.replaceChildren();const max=Math.max(1,...items.map(x=>Number(x.total)||0));const total=items.reduce((s,x)=>s+(Number(x.total)||0),0);for(const item of items){const bar=document.createElement('div');bar.className='timeline-bar';bar.style.height=Math.max(3,(Number(item.total)||0)/max*44)+'px';bar.title=fmtTime(item.time)+' UTC · '+item.total+' 件';bars.append(bar)}document.getElementById('timelineTotal').textContent='合計 '+total.toLocaleString()+' 件';const nonzero=items.filter(x=>Number(x.total)>0).slice(-12).reverse();if(!nonzero.length){const e=document.createElement('div');e.className='empty';e.textContent='直近24時間にイベントはありません';list.append(e);return}for(const item of nonzero){const row=document.createElement('div');row.className='timeline-row';const time=document.createElement('div');time.className='timeline-time';time.textContent=new Date(item.time).toLocaleString('ja-JP',{timeZone:'UTC',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});const pin=document.createElement('div');pin.className='timeline-pin'+(Number(item.errors)>0?' fail':Number(item.scanner_candidates)>0||Number(item.login_attempts)>0?' warn':'');const desc=document.createElement('div');desc.textContent='イベント '+Number(item.total).toLocaleString()+' 件 · エラー '+Number(item.errors).toLocaleString()+' · スキャナー候補 '+Number(item.scanner_candidates).toLocaleString()+' · ログイン試行 '+Number(item.login_attempts).toLocaleString();const count=document.createElement('div');count.className='timeline-count';count.textContent=Number(item.total).toLocaleString()+' 件';row.append(time,pin,desc,count);list.append(row)}}
+function renderPayloadSignals(items){const labels={'payload:sql_injection_candidate':'SQLインジェクション候補','payload:path_traversal_candidate':'パストラバーサル候補','payload:xss_candidate':'XSS候補','payload:command_injection_candidate':'コマンド注入候補','payload:sensitive_path_candidate':'機密パス探索候補'};renderRankList('payloadRanking',items,x=>labels[x.signal]||'その他の分類候補',x=>x.count,'amber')}
+function renderDaily(items){const root=document.getElementById('dailyBars');root.replaceChildren();const max=Math.max(1,...items.map(x=>Number(x.total)||0));const total=items.reduce((s,x)=>s+(Number(x.total)||0),0);for(const item of items){const bar=document.createElement('div');bar.className='timeline-bar';bar.style.height=Math.max(2,(Number(item.total)||0)/max*90)+'px';bar.title=item.day+' · '+Number(item.total).toLocaleString()+'件 · 5xx '+Number(item.errors).toLocaleString();root.append(bar)}document.getElementById('dailyTotal').textContent='30日合計 '+total.toLocaleString()+' 件'}
+function renderBehavior(b){const items=[{name:'エクスプロイト候補',count:b.exploit_candidates},{name:'既知スキャンパス',count:b.common_scan_paths},{name:'非読み取りメソッド',count:b.non_read_methods},{name:'HTTP 4xx',count:b.client_errors},{name:'HTTP 5xx',count:b.server_errors}];renderRankList('behaviorRanking',items,x=>x.name,x=>x.count,'amber')}
 function renderThreatSignals(items){const names={'Exploitパターン候補':'不審な文字列など既知パターンとの一致','既知スキャンパス候補':'よく探索される設定・管理パス','非読み取りHTTPメソッド':'GET/HEAD/OPTIONS以外のメソッド','スキャナー候補':'複数のスキャン兆候を含む分類','検索クローラー申告':'User-Agent上の検索クローラー申告','ログイン試行':'偽ログイン画面への送信イベント','サーバーエラー':'HTTP 5xx応答','管理パス探索候補':'管理画面や設定パスへのアクセス'};renderRankList('threatSignalList',items,x=>x.signal+' — '+(names[x.signal]||'観測パターン'),x=>x.count,'amber')}
 async function refreshHealth(){const api=document.getElementById('healthApi'),db=document.getElementById('healthDb');try{const r=await fetch('/api/dashboard/health',{cache:'no-store'});if(!r.ok)throw Error('health');const h=await r.json();api.textContent=h.status==='ok'?'正常':'要確認';api.style.color=h.status==='ok'?'var(--green)':'var(--red)';db.textContent=h.database==='online'?'接続正常':'接続不可';db.style.color=h.database==='online'?'var(--green)':'var(--red)';document.getElementById('healthEvents').textContent=Number(h.events_5m).toLocaleString();document.getElementById('healthLast').textContent=h.last_event?new Date(h.last_event).toLocaleTimeString('ja-JP',{timeZone:'UTC'}):'未記録';document.getElementById('healthAge').textContent=h.seconds_since_last_event==null?'イベントはまだありません':h.seconds_since_last_event<60?'最終イベントから1分未満':Math.floor(h.seconds_since_last_event/60)+' 分前';document.getElementById('healthChecked').textContent='最終確認 '+new Date(h.checked_at).toLocaleTimeString('ja-JP')+' · この表示はDashboardとDBの簡易チェックです。Honeypot本体の完全な稼働保証ではありません。'}catch(e){api.textContent='確認失敗';api.style.color='var(--red)';db.textContent='状態不明';db.style.color='var(--amber)';document.getElementById('healthChecked').textContent='ヘルスAPIに接続できません。Dashboardの稼働状況を確認してください。'}}
+function renderProtocol(a){const l=a.latency||{};document.getElementById('latencyP50').textContent=l.p50_ms==null?'—':l.p50_ms.toLocaleString()+' ms';document.getElementById('latencyP95').textContent=l.p95_ms==null?'—':l.p95_ms.toLocaleString()+' ms';document.getElementById('latencyMax').textContent=l.max_ms==null?'—':l.max_ms.toLocaleString()+' ms';document.getElementById('latencySamples').textContent='計測サンプル '+Number(l.samples||0).toLocaleString();renderRankList('methodRanking',a.methods||[],x=>x.method,x=>x.count);renderRankList('statusFamilyRanking',a.status_families||[],x=>x.family,x=>x.count);renderPayloadSignals(a.payload_signals||[]);renderBehavior(a.behavior||{});renderDaily(a.daily_30d||[]);renderRankList('countryTrend',a.country_counts_7d||[],x=>x.country,x=>x.count)}
 function renderAlert(a){const box=document.getElementById('alertBanner'),dot=document.getElementById('alertDot');const triggered=!!a.triggered;box.classList.toggle('triggered',triggered);dot.className='status-dot'+(triggered?' fail':'');document.getElementById('alertState').textContent=triggered?'SPIKE DETECTED':'NORMAL';document.getElementById('alertTitle').textContent=triggered?'アクセス急増を検知しました':'アクセス急増は検知されていません';document.getElementById('alertDetail').textContent='直近5分 '+Number(a.recent_5m).toLocaleString()+' 件 · 過去55分の5分換算平均 '+Number(a.baseline_per_5m).toLocaleString()+' 件'+(triggered?' · 通常より大きく増加':' · 閾値に達していません')}
 
-async function refreshAnalytics(){try{const r=await fetch('/api/dashboard/analytics',{cache:'no-store'});if(!r.ok)throw Error('analytics api');const a=await r.json();document.getElementById('lastHour').textContent=Number(a.last_hour).toLocaleString();document.getElementById('errors24').textContent=Number(a.errors_24h).toLocaleString();document.getElementById('scanner24').textContent=Number(a.scanner_candidates_24h).toLocaleString();renderTrend(a.series||[]);renderCategories(a.categories||[]);renderRankList('pathRanking',a.top_paths||[],x=>x.path,x=>x.count);renderRankList('statusRanking',a.statuses||[],x=>'HTTP '+x.status_code,x=>x.count);renderTimeline(a.timeline||[]);renderThreatSignals(a.threat_signals||[]);renderAlert(a.alert||{});}catch(e){document.getElementById('trendHint').textContent='分析データを取得できません';}}
+async function refreshAnalytics(){try{const r=await fetch('/api/dashboard/analytics',{cache:'no-store'});if(!r.ok)throw Error('analytics api');const a=await r.json();document.getElementById('lastHour').textContent=Number(a.last_hour).toLocaleString();document.getElementById('errors24').textContent=Number(a.errors_24h).toLocaleString();document.getElementById('scanner24').textContent=Number(a.scanner_candidates_24h).toLocaleString();renderTrend(a.series||[]);renderCategories(a.categories||[]);renderRankList('pathRanking',a.top_paths||[],x=>x.path,x=>x.count);renderRankList('statusRanking',a.statuses||[],x=>'HTTP '+x.status_code,x=>x.count);renderTimeline(a.timeline||[]);renderThreatSignals(a.threat_signals||[]);renderProtocol(a);renderAlert(a.alert||{});}catch(e){document.getElementById('trendHint').textContent='分析データを取得できません';}}
 
 async function refreshGeo(){try{
  const r=await fetch('/api/dashboard/geo',{cache:'no-store'});if(!r.ok)throw Error('geo api');
@@ -498,8 +598,8 @@ async function refresh(){try{
  if(!s.ok||!e.ok)throw Error('API error');const a=await s.json(),b=await e.json();
  document.getElementById('knocks').textContent=a.knocks.toLocaleString();document.getElementById('passwords').textContent=a.password_attempts.toLocaleString();document.getElementById('probes').textContent=a.admin_probes.toLocaleString();document.getElementById('last24').textContent=a.last_24h.toLocaleString();document.getElementById('intrusionNote').textContent=a.intrusion_note;document.getElementById('recon').textContent=a.recon_visits.toLocaleString();document.getElementById('loginViews').textContent=a.login_page_views.toLocaleString();document.getElementById('pathPasswords').textContent=a.password_attempts.toLocaleString();document.getElementById('pathProbes').textContent=a.admin_probes.toLocaleString();document.getElementById('decoyAccesses').textContent=a.decoy_accesses.toLocaleString();
  const body=document.getElementById('events');body.replaceChildren();
- if(!b.events.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=6;td.className='empty';td.textContent='まだイベントはありません';tr.append(td);body.append(tr)}
- for(const ev of b.events){const tr=document.createElement('tr');const vals=[fmtTime(ev.timestamp),label(ev.category),ev.method,ev.path,String(ev.status_code),(ev.tags||[]).join(', ')||'—'];vals.forEach((v,i)=>{const td=document.createElement('td');td.textContent=v;if(i===3)td.className='path';if(i===1){const span=document.createElement('span');span.className='badge '+badge(ev.category);span.textContent=v;td.replaceChildren(span)}tr.append(td)});body.append(tr)}
+ if(!b.events.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=7;td.className='empty';td.textContent='まだイベントはありません';tr.append(td);body.append(tr)}
+ for(const ev of b.events){const tr=document.createElement('tr');const vals=[fmtTime(ev.timestamp),label(ev.category),ev.method,ev.path,String(ev.status_code),ev.response_ms==null?'—':Number(ev.response_ms).toFixed(1)+' ms',(ev.tags||[]).join(', ')||'—'];vals.forEach((v,i)=>{const td=document.createElement('td');td.textContent=v;if(i===3)td.className='path';if(i===1){const span=document.createElement('span');span.className='badge '+badge(ev.category);span.textContent=v;td.replaceChildren(span)}tr.append(td)});body.append(tr)}
  document.getElementById('updated').textContent='最終更新 '+new Date().toLocaleTimeString('ja-JP');
  }catch(e){document.getElementById('updated').textContent='取得エラー';}}
 initWorldMap().then(()=>{drawHoneypotTarget();refreshGeo()});refresh();refreshGeo();refreshAnalytics();refreshHealth();setInterval(refresh,5000);setInterval(refreshGeo,5000);setInterval(refreshAnalytics,5000);setInterval(refreshHealth,15000);
