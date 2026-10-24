@@ -373,7 +373,7 @@ async def analytics():
           ]::text[]) >= 1
           ORDER BY signal_types DESC, signal_hits DESC, hits DESC LIMIT 10
         """)
-        behavior = await conn.fetch("""
+        behavior = await conn.fetchrow("""
           SELECT COUNT(*) FILTER (WHERE 'signal:non_read_method' = ANY(tags)) AS non_read_methods,
                  COUNT(*) FILTER (WHERE 'signal:common_scan_path' = ANY(tags)) AS common_scan_paths,
                  COUNT(*) FILTER (WHERE 'signal:exploit_probe' = ANY(tags)) AS exploit_candidates,
