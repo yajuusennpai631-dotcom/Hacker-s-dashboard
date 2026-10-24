@@ -354,24 +354,23 @@ async def analytics():
                    'payload:sensitive_path_candidate','signal:exploit_probe',
                    'signal:common_scan_path','signal:non_read_method'
                  ]::text[]) AS signal_hits,
-                 COUNT(DISTINCT signal_tag) FILTER (WHERE signal_tag IS NOT NULL) AS signal_types
-          FROM (
-            SELECT path, tags,
-                   unnest(ARRAY[
-                     CASE WHEN 'payload:sql_injection_candidate' = ANY(tags) THEN 'sql' END,
-                     CASE WHEN 'payload:path_traversal_candidate' = ANY(tags) THEN 'traversal' END,
-                     CASE WHEN 'payload:xss_candidate' = ANY(tags) THEN 'xss' END,
-                     CASE WHEN 'payload:command_injection_candidate' = ANY(tags) THEN 'command' END,
-                     CASE WHEN 'payload:sensitive_path_candidate' = ANY(tags) THEN 'sensitive_path' END,
-                     CASE WHEN 'signal:exploit_probe' = ANY(tags) THEN 'exploit' END,
-                     CASE WHEN 'signal:common_scan_path' = ANY(tags) THEN 'scan_path' END,
-                     CASE WHEN 'signal:non_read_method' = ANY(tags) THEN 'method' END
-                   ]) AS signal_tag
-            FROM events
-            WHERE occurred_at >= NOW() - INTERVAL '15 minutes' AND path <> '/health'
-          ) e
+                 (COUNT(DISTINCT CASE WHEN 'payload:sql_injection_candidate' = ANY(tags) THEN 'sql' END)
+                 + COUNT(DISTINCT CASE WHEN 'payload:path_traversal_candidate' = ANY(tags) THEN 'traversal' END)
+                 + COUNT(DISTINCT CASE WHEN 'payload:xss_candidate' = ANY(tags) THEN 'xss' END)
+                 + COUNT(DISTINCT CASE WHEN 'payload:command_injection_candidate' = ANY(tags) THEN 'command' END)
+                 + COUNT(DISTINCT CASE WHEN 'payload:sensitive_path_candidate' = ANY(tags) THEN 'sensitive_path' END)
+                 + COUNT(DISTINCT CASE WHEN 'signal:exploit_probe' = ANY(tags) THEN 'exploit' END)
+                 + COUNT(DISTINCT CASE WHEN 'signal:common_scan_path' = ANY(tags) THEN 'scan_path' END)
+                 + COUNT(DISTINCT CASE WHEN 'signal:non_read_method' = ANY(tags) THEN 'method' END)) AS signal_types
+          FROM events
+          WHERE occurred_at >= NOW() - INTERVAL '15 minutes' AND path <> '/health'
           GROUP BY path
-          HAVING COUNT(*) >= 2 AND COUNT(DISTINCT signal_tag) FILTER (WHERE signal_tag IS NOT NULL) >= 1
+          HAVING COUNT(*) >= 2 AND COUNT(*) FILTER (WHERE tags && ARRAY[
+            'payload:sql_injection_candidate','payload:path_traversal_candidate',
+            'payload:xss_candidate','payload:command_injection_candidate',
+            'payload:sensitive_path_candidate','signal:exploit_probe',
+            'signal:common_scan_path','signal:non_read_method'
+          ]::text[]) >= 1
           ORDER BY signal_types DESC, signal_hits DESC, hits DESC LIMIT 10
         """)
         behavior = await conn.fetch("""
