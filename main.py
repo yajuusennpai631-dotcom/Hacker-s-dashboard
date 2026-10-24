@@ -221,6 +221,7 @@ async def home():
 
 PAGE = r"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="google-site-verification" content="62QmyJujyPwsJeOmgEp3YLICDEkZNAro_t5qLEHgR2w" />
 <meta name="description" content="MK Honeypot — 公開ハニーポット観測ダッシュボード。匿名化・集計したアクセス傾向を公開します。">
 <title>MK Honeypot — Public Monitor</title>
 <style>
