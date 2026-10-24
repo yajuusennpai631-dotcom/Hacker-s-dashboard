@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from html import escape
 
 import asyncpg
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -20,8 +21,16 @@ CREATE TABLE IF NOT EXISTS events (
   method TEXT NOT NULL,
   path TEXT NOT NULL,
   status_code INTEGER NOT NULL,
-  tags TEXT[] NOT NULL DEFAULT '{}'
+  tags TEXT[] NOT NULL DEFAULT '{}',
+  geo_country TEXT,
+  geo_city TEXT,
+  geo_lat DOUBLE PRECISION,
+  geo_lon DOUBLE PRECISION
 );
+ALTER TABLE events ADD COLUMN IF NOT EXISTS geo_country TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS geo_city TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS geo_lat DOUBLE PRECISION;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS geo_lon DOUBLE PRECISION;
 CREATE INDEX IF NOT EXISTS events_occurred_at_idx ON events (occurred_at DESC);
 CREATE INDEX IF NOT EXISTS events_type_idx ON events (event_type);
 """
@@ -61,6 +70,7 @@ class EventIn(BaseModel):
     path: str = Field(default="/", max_length=300)
     status_code: int = Field(default=200, ge=100, le=599)
     tags: list[str] = Field(default_factory=list, max_length=30)
+    client_ip: str | None = Field(default=None, max_length=64)
 
 def classify(event_type: str, path: str) -> str:
     p = path.lower()
@@ -85,15 +95,35 @@ async def ingest(event: EventIn, authorization: str | None = Header(default=None
     if not INGEST_TOKEN or authorization != f"Bearer {INGEST_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
     occurred_at = event.timestamp or datetime.now(timezone.utc)
-    # Public dashboard intentionally excludes IP addresses, user-agent strings,
-    # query values, request bodies, and credentials.
+    # Only coarse geolocation is retained; raw IP is sent to the lookup provider
+    # for resolution and is never written to the database or public API.
     path = event.path.split("?", 1)[0][:300]
     tags = [str(t)[:80] for t in event.tags[:30]]
+    country = city = None
+    lat = lon = None
+    ip = (event.client_ip or "").strip()
+    if ip and ip not in {"127.0.0.1", "::1"}:
+        try:
+            import ipaddress
+            parsed_ip = ipaddress.ip_address(ip)
+            if parsed_ip.is_global:
+                async with httpx.AsyncClient(timeout=1.5, follow_redirects=False) as client:
+                    response = await client.get("https://ipwho.is/" + parsed_ip.compressed)
+                    data = response.json() if response.status_code == 200 else {}
+                if data.get("success"):
+                    country = str(data.get("country") or "")[:100] or None
+                    city = str(data.get("city") or "")[:100] or None
+                    if isinstance(data.get("latitude"), (int, float)) and isinstance(data.get("longitude"), (int, float)):
+                        lat, lon = float(data["latitude"]), float(data["longitude"])
+        except Exception:
+            pass
     async with app.state.pool.acquire() as conn:
         await conn.execute(
-            """INSERT INTO events (occurred_at, event_type, method, path, status_code, tags)
-               VALUES ($1, $2, $3, $4, $5, $6)""",
-            occurred_at, event.event[:50], event.method[:12], path, event.status_code, tags
+            """INSERT INTO events
+               (occurred_at, event_type, method, path, status_code, tags, geo_country, geo_city, geo_lat, geo_lon)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
+            occurred_at, event.event[:50], event.method[:12], path, event.status_code, tags,
+            country, city, lat, lon
         )
     return {"accepted": True}
 
@@ -126,6 +156,26 @@ async def summary():
         "last_event": row["last_event"].isoformat() if row["last_event"] else None,
         "intrusion_success": None,
         "intrusion_note": "この囮アプリには実システムへの侵入経路がないため、実侵入の成否は判定できません。"
+    }
+
+@app.get("/api/dashboard/geo")
+async def geo_events():
+    async with app.state.pool.acquire() as conn:
+        rows = await conn.fetch("""
+          SELECT id, occurred_at, geo_country, geo_city, geo_lat, geo_lon
+          FROM events WHERE geo_lat IS NOT NULL AND geo_lon IS NOT NULL
+          ORDER BY occurred_at DESC LIMIT 200
+        """)
+        countries = await conn.fetch("""
+          SELECT geo_country AS country, COUNT(*) AS count FROM events
+          WHERE geo_country IS NOT NULL GROUP BY geo_country
+          ORDER BY count DESC LIMIT 12
+        """)
+    return {
+        "points": [{"id": r["id"], "timestamp": r["occurred_at"].isoformat(),
+                    "country": r["geo_country"], "city": r["geo_city"],
+                    "lat": r["geo_lat"], "lon": r["geo_lon"]} for r in rows],
+        "countries": [{"country": r["country"], "count": r["count"]} for r in countries]
     }
 
 @app.get("/api/dashboard/events")
@@ -169,8 +219,8 @@ h1{font-size:clamp(21px,4vw,30px);margin:0;letter-spacing:.02em}.sub{color:var(-
 section{margin-top:28px}.sectionhead{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}h2{font-size:17px;margin:0}.small{color:var(--muted);font-size:12px}
 .tablewrap{overflow:auto;border:1px solid var(--line);border-radius:12px;background:#0d1523}table{width:100%;border-collapse:collapse;min-width:650px}th,td{text-align:left;padding:12px 14px;border-bottom:1px solid #1d2a3e;font-size:13px}th{color:var(--muted);font-weight:600;background:#111b2c}td.path{font-family:ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}.badge{display:inline-block;border-radius:6px;padding:3px 7px;background:#1a2b41;color:#bdd5f4;font-size:11px}.badge.warn{background:#392819;color:#ffd08a}.badge.fail{background:#3a202b;color:#ff9da5}.empty{color:var(--muted);text-align:center;padding:28px}
 .pathway{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.stage{border:1px solid var(--line);border-radius:10px;padding:14px;background:#0d1523;min-width:0}.stage-num{color:var(--green);font-size:11px;letter-spacing:.08em}.stage-name{font-size:13px;margin:7px 0}.stage-count{font-size:25px;font-weight:750}.stage-arrow{color:#66809f;font-size:12px;margin-top:4px}
-footer{margin-top:28px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
-@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.pathway{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:480px){main{padding:20px 12px 36px}.grid{gap:9px}.card{padding:13px}.top{align-items:flex-start}.live{font-size:11px}}
+.maplayout{display:grid;grid-template-columns:minmax(0,2fr) minmax(210px,1fr);gap:14px}.mapbox{overflow:hidden;background:radial-gradient(ellipse at center,#12243a,#08111e 78%);border:1px solid var(--line);border-radius:12px;min-height:300px}#worldmap{display:block;width:100%;height:auto;min-height:300px}.land{fill:#1b3048;stroke:#29415d;stroke-width:1.2}.mapgrid{stroke:#1a2b40;stroke-width:1;fill:none}.geo-point{fill:#59e6aa;stroke:#b8ffe0;stroke-width:1.5;cursor:pointer}.pulse{fill:none;stroke:#59e6aa;stroke-width:2;transform-box:fill-box;transform-origin:center;animation:pulse 2.2s ease-out infinite}@keyframes pulse{0%{opacity:.9;transform:scale(.4)}100%{opacity:0;transform:scale(3.8)}}.countrylist{display:flex;flex-direction:column;gap:8px}.countryrow{display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid var(--line);padding:8px 0;font-size:13px}.countryrow b{color:var(--green)}footer{margin-top:28px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.pathway{grid-template-columns:repeat(2,minmax(0,1fr))}.maplayout{grid-template-columns:1fr}}@media(max-width:480px){main{padding:20px 12px 36px}.grid{gap:9px}.card{padding:13px}.top{align-items:flex-start}.live{font-size:11px}}
 </style></head><body><main>
 <header class="top"><div class="brand"><div class="mark">H</div><div><h1>Hacker Trap</h1><div class="sub">PUBLIC SECURITY OBSERVABILITY · LIVE EVENT FEED</div></div></div><div class="live">● 公開モニター</div></header>
 <div class="notice">公開ダッシュボードです。プライバシー保護のため、IPアドレス・ユーザーエージェント・認証情報は表示しません。ここでの「ノック」はアクセスの観測を意味し、侵入成功を意味しません。</div>
@@ -181,6 +231,12 @@ footer{margin-top:28px;color:var(--muted);font-size:12px;display:flex;justify-co
 <article class="card"><div class="label">直近24時間のイベント</div><div class="value green" id="last24">—</div><div class="hint">保存された全イベント</div></article>
 </div>
 <section><div class="sectionhead"><h2>侵入状況</h2><span class="small">判定の限界</span></div><div class="card"><div class="value amber" style="font-size:20px">実侵入：判定対象外</div><div class="hint" id="intrusionNote">この囮アプリは本物の内部システムを公開していないため、実侵入の成功を判定できません。</div></div></section>
+<section><div class="sectionhead"><h2>アクセス元マップ</h2><span class="small">IPベースの概算位置・5秒ごとに更新</span></div>
+<div class="maplayout"><div class="mapbox"><svg id="worldmap" viewBox="0 0 1000 500" role="img" aria-label="アクセス元の概算位置を示す世界地図">
+<g class="mapgrid"><path d="M0 100H1000 M0 200H1000 M0 300H1000 M0 400H1000 M200 0V500 M400 0V500 M600 0V500 M800 0V500"/></g>
+<g class="land"><path d="M80 90 L130 55 205 65 240 95 225 130 190 145 175 190 145 220 125 195 115 155 85 130Z"/><path d="M205 220 L250 235 275 280 260 330 240 380 220 350 215 300 195 265Z"/><path d="M390 90 L430 65 485 70 515 95 500 120 465 130 450 155 420 145 405 115Z"/><path d="M455 155 L500 145 535 175 550 225 525 280 500 315 475 280 465 230 440 195Z"/><path d="M510 85 L590 55 690 65 755 90 820 105 875 140 850 170 800 165 770 190 730 175 690 205 650 180 615 145 565 130Z"/><path d="M740 215 L790 205 825 235 815 275 785 300 760 270Z"/><path d="M850 330 L900 320 930 350 915 385 870 380 845 355Z"/></g><g id="geo-points"></g></svg></div>
+<div class="card"><h2>アクセス元の国・地域</h2><div class="hint" style="margin-bottom:10px">直近の位置情報付きイベント</div><div id="countries" class="countrylist"><div class="empty">位置情報を待っています…</div></div><div class="hint" style="margin-top:14px">位置はIPアドレスから推定した概算です。VPN、携帯回線、プロキシなどにより実際の所在地とは異なる場合があります。</div></div></div>
+<div class="hint" style="margin-top:8px">IPアドレスそのものは保存・公開しません。位置推定には外部のIPジオロケーションサービスを利用します。位置情報が取得できないイベントは地図に表示されません。</div></section>
 <section><div class="sectionhead"><h2>観測された侵入経路</h2><span class="small">各段階の累計・同一人物の追跡ではありません</span></div><div class="pathway">
 <div class="stage"><div class="stage-num">STEP 01</div><div class="stage-name">偵察・トップページ</div><div class="stage-count" id="recon">—</div><div class="stage-arrow">アクセス観測</div></div>
 <div class="stage"><div class="stage-num">STEP 02</div><div class="stage-name">ログイン画面</div><div class="stage-count" id="loginViews">—</div><div class="stage-arrow">画面表示</div></div>
@@ -195,6 +251,19 @@ footer{margin-top:28px;color:var(--muted);font-size:12px;display:flex;justify-co
 const fmtTime=s=>{try{return new Date(s).toISOString().replace('T',' ').slice(0,19)}catch{return s||'—'}};
 const label=c=>({http_request:'ノック / HTTP',login_attempt:'パスワード試行',server_error:'サーバーエラー',admin_probe:'管理画面探索',password_attempt:'パスワード試行',knock:'ノック / HTTP',request:'リクエスト'}[c]||c);
 const badge=c=>c==='login_attempt'||c==='password_attempt'?'warn':c==='server_error'||c==='admin_probe'?'fail':'';
+function project(lon,lat){return {x:(lon+180)/360*1000,y:(90-lat)/180*500}}
+async function refreshGeo(){try{
+ const r=await fetch('/api/dashboard/geo',{cache:'no-store'});if(!r.ok)throw Error('geo api');
+ const data=await r.json(),layer=document.getElementById('geo-points');layer.replaceChildren();
+ for(const p of (data.points||[])){const q=project(p.lon,p.lat);if(q.x<0||q.x>1000||q.y<0||q.y>500)continue;
+ const g=document.createElementNS('http://www.w3.org/2000/svg','g');g.setAttribute('transform','translate('+q.x+','+q.y+')');
+ const pulse=document.createElementNS('http://www.w3.org/2000/svg','circle');pulse.setAttribute('r','4');pulse.setAttribute('class','pulse');g.append(pulse);
+ const dot=document.createElementNS('http://www.w3.org/2000/svg','circle');dot.setAttribute('r','3.5');dot.setAttribute('class','geo-point');
+ const title=document.createElementNS('http://www.w3.org/2000/svg','title');title.textContent=[p.city,p.country,fmtTime(p.timestamp)].filter(Boolean).join(' · ');dot.append(title);g.append(dot);layer.append(g);}
+ const list=document.getElementById('countries');list.replaceChildren();
+ if(!(data.countries||[]).length){const e=document.createElement('div');e.className='empty';e.textContent='まだ位置情報付きイベントはありません';list.append(e)}
+ for(const item of (data.countries||[])){const row=document.createElement('div');row.className='countryrow';const name=document.createElement('span');name.textContent=item.country;const count=document.createElement('b');count.textContent=Number(item.count).toLocaleString();row.append(name,count);list.append(row)}
+ }catch(e){document.getElementById('countries').textContent='位置情報を取得できません';}}
 async function refresh(){try{
  const [s,e]=await Promise.all([fetch('/api/dashboard/summary',{cache:'no-store'}),fetch('/api/dashboard/events?limit=50',{cache:'no-store'})]);
  if(!s.ok||!e.ok)throw Error('API error');const a=await s.json(),b=await e.json();
@@ -204,5 +273,5 @@ async function refresh(){try{
  for(const ev of b.events){const tr=document.createElement('tr');const vals=[fmtTime(ev.timestamp),label(ev.category),ev.method,ev.path,String(ev.status_code),(ev.tags||[]).join(', ')||'—'];vals.forEach((v,i)=>{const td=document.createElement('td');td.textContent=v;if(i===3)td.className='path';if(i===1){const span=document.createElement('span');span.className='badge '+badge(ev.category);span.textContent=v;td.replaceChildren(span)}tr.append(td)});body.append(tr)}
  document.getElementById('updated').textContent='最終更新 '+new Date().toLocaleTimeString('ja-JP');
  }catch(e){document.getElementById('updated').textContent='取得エラー';}}
-refresh();setInterval(refresh,5000);
+refresh();refreshGeo();setInterval(refresh,5000);setInterval(refreshGeo,5000);
 </script></body></html>"""
