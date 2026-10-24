@@ -98,7 +98,7 @@ async def summary():
     async with app.state.pool.acquire() as conn:
         row = await conn.fetchrow("""
           SELECT
-            COUNT(*) FILTER (WHERE event_type = 'http_request') AS knocks,
+            COUNT(*) FILTER (WHERE event_type = 'http_request' AND path <> '/health') AS knocks,
             COUNT(*) FILTER (WHERE event_type = 'login_attempt') AS password_attempts,
             COUNT(*) FILTER (WHERE event_type = 'http_request' AND
               (LOWER(path) LIKE '%/admin%' OR LOWER(path) LIKE '%wp-login%' OR LOWER(path) LIKE '%wp-admin%' OR LOWER(path) LIKE '%phpmyadmin%' OR LOWER(path) LIKE '%/.env%')) AS admin_probes,
@@ -124,7 +124,7 @@ async def recent_events(limit: int = 50):
     async with app.state.pool.acquire() as conn:
         rows = await conn.fetch("""
           SELECT id, occurred_at, event_type, method, path, status_code, tags
-          FROM events ORDER BY occurred_at DESC LIMIT $1
+          FROM events WHERE path <> '/health' ORDER BY occurred_at DESC LIMIT $1
         """, limit)
     result = []
     for r in rows:
