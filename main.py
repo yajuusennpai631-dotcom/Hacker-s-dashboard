@@ -543,7 +543,7 @@ section{margin-top:28px}.sectionhead{display:flex;align-items:baseline;justify-c
 <div class="stage"><div class="stage-num">STEP 04</div><div class="stage-name">管理画面探索</div><div class="stage-count" id="pathProbes">—</div><div class="stage-arrow">既知パスへのアクセス</div></div>
 <div class="stage"><div class="stage-num">STEP 05</div><div class="stage-name">囮コンソール到達</div><div class="stage-count" id="decoyAccesses">—</div><div class="stage-arrow">/fake-shell · 実行機能なし</div></div>
 </div><div class="hint" style="margin-top:9px">これは段階別の累計です。プライバシー保護のため訪問者を識別・追跡しておらず、個々のアクセスがこの順番で進んだことを意味しません。</div></section>
-<section><div class="sectionhead"><h2>最新イベント</h2><span class="small" id="updated">読み込み中</span></div><div class="tablewrap"><table><thead><tr><th>時刻 (UTC)</th><th>分類</th><th>メソッド</th><th>パス</th><th>HTTP</th><th>タグ</th></tr></thead><tbody id="events"><tr><td colspan="6" class="empty">イベントを取得しています…</td></tr></tbody></table></div></section>
+<section><div class="sectionhead"><h2>最新イベント</h2><span class="small" id="updated">読み込み中</span></div><div class="tablewrap"><table><thead><tr><th>時刻 (UTC)</th><th>分類</th><th>メソッド</th><th>パス</th><th>HTTP</th><th>応答時間</th><th>タグ</th></tr></thead><tbody id="events"><tr><td colspan="7" class="empty">イベントを取得しています…</td></tr></tbody></table></div></section>
 <footer><span>MK Honeypot · Public dashboard</span><span>5秒ごとに更新 · 公開表示用に匿名化</span></footer>
 </main>
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script><script src="https://cdn.jsdelivr.net/npm/topojson-client@3"></script><script>
