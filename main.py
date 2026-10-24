@@ -64,11 +64,15 @@ class EventIn(BaseModel):
 
 def classify(event_type: str, path: str) -> str:
     p = path.lower()
-    if event_type == "login_attempt" or (p == "/login" and event_type != "http_request"):
+    if event_type == "fake_shell_access":
+        return "decoy_access"
+    if event_type == "login_attempt":
         return "password_attempt"
-    if any(x in p for x in ("/admin", "/dashboard", "wp-login", "wp-admin", "/.env", "phpmyadmin")):
+    if any(x in p for x in ("/admin", "/dashboard", "wp-login", "wp-admin", "/.env", "phpmyadmin", "/config", "/backup")):
         return "admin_probe"
-    if event_type == "server_error" or event_type == "http_request" and path != "/health":
+    if event_type == "server_error":
+        return "server_error"
+    if event_type == "http_request" and path != "/health":
         return "knock"
     return "request"
 
@@ -103,6 +107,9 @@ async def summary():
             COUNT(*) FILTER (WHERE event_type = 'http_request' AND
               (LOWER(path) LIKE '%/admin%' OR LOWER(path) LIKE '%wp-login%' OR LOWER(path) LIKE '%wp-admin%' OR LOWER(path) LIKE '%phpmyadmin%' OR LOWER(path) LIKE '%/.env%')) AS admin_probes,
             COUNT(*) FILTER (WHERE event_type = 'server_error') AS server_errors,
+            COUNT(*) FILTER (WHERE event_type = 'http_request' AND method = 'GET' AND path = '/') AS recon_visits,
+            COUNT(*) FILTER (WHERE event_type = 'http_request' AND method = 'GET' AND path = '/login') AS login_page_views,
+            COUNT(*) FILTER (WHERE event_type = 'fake_shell_access') AS decoy_accesses,
             COUNT(*) FILTER (WHERE occurred_at >= NOW() - INTERVAL '24 hours') AS last_24h,
             MAX(occurred_at) AS last_event
           FROM events
@@ -112,6 +119,9 @@ async def summary():
         "password_attempts": row["password_attempts"],
         "admin_probes": row["admin_probes"],
         "server_errors": row["server_errors"],
+        "recon_visits": row["recon_visits"],
+        "login_page_views": row["login_page_views"],
+        "decoy_accesses": row["decoy_accesses"],
         "last_24h": row["last_24h"],
         "last_event": row["last_event"].isoformat() if row["last_event"] else None,
         "intrusion_success": None,
@@ -158,8 +168,9 @@ h1{font-size:clamp(21px,4vw,30px);margin:0;letter-spacing:.02em}.sub{color:var(-
 .grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:linear-gradient(145deg,#141f33,#101827);border:1px solid var(--line);border-radius:14px;padding:18px;min-width:0}.label{color:var(--muted);font-size:13px}.value{font-size:clamp(26px,4vw,38px);font-weight:750;letter-spacing:-.03em;margin:9px 0 4px}.hint{color:var(--muted);font-size:12px}.green{color:var(--green)}.amber{color:var(--amber)}.red{color:var(--red)}
 section{margin-top:28px}.sectionhead{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}h2{font-size:17px;margin:0}.small{color:var(--muted);font-size:12px}
 .tablewrap{overflow:auto;border:1px solid var(--line);border-radius:12px;background:#0d1523}table{width:100%;border-collapse:collapse;min-width:650px}th,td{text-align:left;padding:12px 14px;border-bottom:1px solid #1d2a3e;font-size:13px}th{color:var(--muted);font-weight:600;background:#111b2c}td.path{font-family:ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}.badge{display:inline-block;border-radius:6px;padding:3px 7px;background:#1a2b41;color:#bdd5f4;font-size:11px}.badge.warn{background:#392819;color:#ffd08a}.badge.fail{background:#3a202b;color:#ff9da5}.empty{color:var(--muted);text-align:center;padding:28px}
+.pathway{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.stage{border:1px solid var(--line);border-radius:10px;padding:14px;background:#0d1523;min-width:0}.stage-num{color:var(--green);font-size:11px;letter-spacing:.08em}.stage-name{font-size:13px;margin:7px 0}.stage-count{font-size:25px;font-weight:750}.stage-arrow{color:#66809f;font-size:12px;margin-top:4px}
 footer{margin-top:28px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
-@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:480px){main{padding:20px 12px 36px}.grid{gap:9px}.card{padding:13px}.top{align-items:flex-start}.live{font-size:11px}}
+@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.pathway{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:480px){main{padding:20px 12px 36px}.grid{gap:9px}.card{padding:13px}.top{align-items:flex-start}.live{font-size:11px}}
 </style></head><body><main>
 <header class="top"><div class="brand"><div class="mark">H</div><div><h1>Hacker Trap</h1><div class="sub">PUBLIC SECURITY OBSERVABILITY · LIVE EVENT FEED</div></div></div><div class="live">● 公開モニター</div></header>
 <div class="notice">公開ダッシュボードです。プライバシー保護のため、IPアドレス・ユーザーエージェント・認証情報は表示しません。ここでの「ノック」はアクセスの観測を意味し、侵入成功を意味しません。</div>
@@ -170,6 +181,13 @@ footer{margin-top:28px;color:var(--muted);font-size:12px;display:flex;justify-co
 <article class="card"><div class="label">直近24時間のイベント</div><div class="value green" id="last24">—</div><div class="hint">保存された全イベント</div></article>
 </div>
 <section><div class="sectionhead"><h2>侵入状況</h2><span class="small">判定の限界</span></div><div class="card"><div class="value amber" style="font-size:20px">実侵入：判定対象外</div><div class="hint" id="intrusionNote">この囮アプリは本物の内部システムを公開していないため、実侵入の成功を判定できません。</div></div></section>
+<section><div class="sectionhead"><h2>観測された侵入経路</h2><span class="small">各段階の累計・同一人物の追跡ではありません</span></div><div class="pathway">
+<div class="stage"><div class="stage-num">STEP 01</div><div class="stage-name">偵察・トップページ</div><div class="stage-count" id="recon">—</div><div class="stage-arrow">アクセス観測</div></div>
+<div class="stage"><div class="stage-num">STEP 02</div><div class="stage-name">ログイン画面</div><div class="stage-count" id="loginViews">—</div><div class="stage-arrow">画面表示</div></div>
+<div class="stage"><div class="stage-num">STEP 03</div><div class="stage-name">パスワード試行</div><div class="stage-count" id="pathPasswords">—</div><div class="stage-arrow">POST リクエスト</div></div>
+<div class="stage"><div class="stage-num">STEP 04</div><div class="stage-name">管理画面探索</div><div class="stage-count" id="pathProbes">—</div><div class="stage-arrow">既知パスへのアクセス</div></div>
+<div class="stage"><div class="stage-num">STEP 05</div><div class="stage-name">囮コンソール到達</div><div class="stage-count" id="decoyAccesses">—</div><div class="stage-arrow">/fake-shell · 実行機能なし</div></div>
+</div><div class="hint" style="margin-top:9px">これは段階別の累計です。プライバシー保護のため訪問者を識別・追跡しておらず、個々のアクセスがこの順番で進んだことを意味しません。</div></section>
 <section><div class="sectionhead"><h2>最新イベント</h2><span class="small" id="updated">読み込み中</span></div><div class="tablewrap"><table><thead><tr><th>時刻 (UTC)</th><th>分類</th><th>メソッド</th><th>パス</th><th>HTTP</th><th>タグ</th></tr></thead><tbody id="events"><tr><td colspan="6" class="empty">イベントを取得しています…</td></tr></tbody></table></div></section>
 <footer><span>Hacker Trap · Public dashboard</span><span>5秒ごとに更新 · 公開表示用に匿名化</span></footer>
 </main>
@@ -180,7 +198,7 @@ const badge=c=>c==='login_attempt'||c==='password_attempt'?'warn':c==='server_er
 async function refresh(){try{
  const [s,e]=await Promise.all([fetch('/api/dashboard/summary',{cache:'no-store'}),fetch('/api/dashboard/events?limit=50',{cache:'no-store'})]);
  if(!s.ok||!e.ok)throw Error('API error');const a=await s.json(),b=await e.json();
- document.getElementById('knocks').textContent=a.knocks.toLocaleString();document.getElementById('passwords').textContent=a.password_attempts.toLocaleString();document.getElementById('probes').textContent=a.admin_probes.toLocaleString();document.getElementById('last24').textContent=a.last_24h.toLocaleString();document.getElementById('intrusionNote').textContent=a.intrusion_note;
+ document.getElementById('knocks').textContent=a.knocks.toLocaleString();document.getElementById('passwords').textContent=a.password_attempts.toLocaleString();document.getElementById('probes').textContent=a.admin_probes.toLocaleString();document.getElementById('last24').textContent=a.last_24h.toLocaleString();document.getElementById('intrusionNote').textContent=a.intrusion_note;document.getElementById('recon').textContent=a.recon_visits.toLocaleString();document.getElementById('loginViews').textContent=a.login_page_views.toLocaleString();document.getElementById('pathPasswords').textContent=a.password_attempts.toLocaleString();document.getElementById('pathProbes').textContent=a.admin_probes.toLocaleString();document.getElementById('decoyAccesses').textContent=a.decoy_accesses.toLocaleString();
  const body=document.getElementById('events');body.replaceChildren();
  if(!b.events.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=6;td.className='empty';td.textContent='まだイベントはありません';tr.append(td);body.append(tr)}
  for(const ev of b.events){const tr=document.createElement('tr');const vals=[fmtTime(ev.timestamp),label(ev.category),ev.method,ev.path,String(ev.status_code),(ev.tags||[]).join(', ')||'—'];vals.forEach((v,i)=>{const td=document.createElement('td');td.textContent=v;if(i===3)td.className='path';if(i===1){const span=document.createElement('span');span.className='badge '+badge(ev.category);span.textContent=v;td.replaceChildren(span)}tr.append(td)});body.append(tr)}
