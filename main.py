@@ -18,6 +18,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
   id BIGSERIAL PRIMARY KEY,
   occurred_at TIMESTAMPTZ NOT NULL,
+  actor_key TEXT,
   event_type TEXT NOT NULL,
   method TEXT NOT NULL,
   path TEXT NOT NULL,
@@ -34,11 +35,13 @@ ALTER TABLE events ADD COLUMN IF NOT EXISTS geo_city TEXT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS geo_lat DOUBLE PRECISION;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS geo_lon DOUBLE PRECISION;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS response_ms DOUBLE PRECISION;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS actor_key TEXT;
 CREATE INDEX IF NOT EXISTS events_occurred_at_idx ON events (occurred_at DESC);
 CREATE INDEX IF NOT EXISTS events_type_idx ON events (event_type);
 CREATE INDEX IF NOT EXISTS events_path_idx ON events (path);
 CREATE INDEX IF NOT EXISTS events_status_idx ON events (status_code);
 CREATE INDEX IF NOT EXISTS events_method_time_idx ON events (method, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS events_actor_time_idx ON events (actor_key, occurred_at DESC) WHERE actor_key IS NOT NULL;
 """
 
 async def open_pool():
@@ -78,6 +81,7 @@ class EventIn(BaseModel):
     tags: list[str] = Field(default_factory=list, max_length=30)
     client_ip: str | None = Field(default=None, max_length=64)
     response_ms: float | None = Field(default=None, ge=0, le=120000)
+    actor_key: str | None = Field(default=None, max_length=64)
 
 PUBLIC_TAGS = {
     "ua_claim:search_crawler", "ua_claim:scanner_tool", "ua_claim:automation",
@@ -142,10 +146,10 @@ async def ingest(event: EventIn, authorization: str | None = Header(default=None
     async with app.state.pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO events
-               (occurred_at, event_type, method, path, status_code, tags, geo_country, geo_city, geo_lat, geo_lon, response_ms)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)""",
+               (occurred_at, event_type, method, path, status_code, tags, geo_country, geo_city, geo_lat, geo_lon, response_ms, actor_key)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)""",
             occurred_at, event.event[:50], event.method[:12], path, event.status_code, tags,
-            country, city, lat, lon, event.response_ms
+            country, city, lat, lon, event.response_ms, event.actor_key
         )
     return {"accepted": True}
 
@@ -373,6 +377,21 @@ async def analytics():
           ]::text[]) >= 1
           ORDER BY signal_types DESC, signal_hits DESC, hits DESC LIMIT 10
         """)
+        bot_profiles = await conn.fetch("""
+          SELECT actor_key, COUNT(*) AS hits, COUNT(DISTINCT path) AS unique_paths,
+                 COUNT(*) FILTER (WHERE tags && ARRAY[
+                   'assessment:scanner_like', 'signal:exploit_probe', 'signal:common_scan_path',
+                   'payload:sql_injection_candidate', 'payload:path_traversal_candidate',
+                   'payload:xss_candidate', 'payload:command_injection_candidate',
+                   'payload:sensitive_path_candidate'
+                 ]::text[]) AS signal_hits,
+                 MIN(occurred_at) AS first_seen, MAX(occurred_at) AS last_seen
+          FROM events
+          WHERE actor_key IS NOT NULL AND occurred_at >= NOW() - INTERVAL '24 hours' AND path <> '/health'
+          GROUP BY actor_key
+          HAVING COUNT(*) >= 3
+          ORDER BY hits DESC, signal_hits DESC LIMIT 8
+        """)
         behavior = await conn.fetchrow("""
           SELECT COUNT(*) FILTER (WHERE 'signal:non_read_method' = ANY(tags)) AS non_read_methods,
                  COUNT(*) FILTER (WHERE 'signal:common_scan_path' = ANY(tags)) AS common_scan_paths,
@@ -403,6 +422,7 @@ async def analytics():
         "behavior": {**{k: int(behavior[k] or 0) for k in ("non_read_methods", "common_scan_paths", "exploit_candidates", "client_errors", "server_errors")}, "repeated_paths_1h": int(path_behavior["repeated_paths_1h"] or 0), "burst_paths_5m": int(path_behavior["burst_paths_5m"] or 0), "unique_paths_1h": int(path_behavior["unique_paths_1h"] or 0)},
         "burst_paths": [{"path": r["path"], "count": r["count"]} for r in burst_paths],
         "path_correlations": [{"path": r["path"], "hits": r["hits"], "signal_hits": r["signal_hits"], "signal_types": r["signal_types"]} for r in path_correlations],
+        "bot_profiles": [{"label": f"Bot候補 {i + 1:02d}", "hits": r["hits"], "unique_paths": r["unique_paths"], "signal_hits": r["signal_hits"], "first_seen": r["first_seen"].isoformat(), "last_seen": r["last_seen"].isoformat()} for i, r in enumerate(bot_profiles)],
         "last_hour": totals["last_hour"],
         "errors_24h": totals["errors_24h"],
         "scanner_candidates_24h": totals["scanner_candidates_24h"],
@@ -675,6 +695,7 @@ footer{border-top:1px solid #1e2d42;padding-top:16px}
 <div class="stage"><div class="stage-num">STEP 04</div><div class="stage-name">管理画面探索</div><div class="stage-count" id="pathProbes">—</div><div class="stage-arrow">既知パスへのアクセス</div></div>
 <div class="stage"><div class="stage-num">STEP 05</div><div class="stage-name">囮コンソール到達</div><div class="stage-count" id="decoyAccesses">—</div><div class="stage-arrow">/fake-shell · 実行機能なし</div></div>
 </div><div class="hint" style="margin-top:9px">これは段階別の累計です。プライバシー保護のため訪問者を識別・追跡しておらず、個々のアクセスがこの順番で進んだことを意味しません。</div></section>
+<section><div class="sectionhead"><h2>Bot 行動プロファイル</h2><span class="small">直近24時間 · 鍵付き仮名による集計</span></div><div class="card"><div class="hint">同一のアクセス元候補による反復をまとめます。IP や User-Agent 自体は保存・表示せず、同一 Bot の断定ではありません。</div><div id="botProfiles" class="rank-list" style="margin-top:14px"><div class="empty">プロファイルを読み込み中</div></div></div></section>
 <section><div class="sectionhead"><h2>最新イベント</h2><span class="small" id="updated">読み込み中</span></div><div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px"><input id="eventSearch" type="search" placeholder="パス・分類・タグを検索…" aria-label="イベント検索" style="flex:1;min-width:220px;background:#0b1422;border:1px solid var(--line);border-radius:9px;padding:11px 12px;color:var(--text);font:inherit"><select id="eventStatusFilter" aria-label="HTTPステータスで絞り込み" style="background:#0b1422;border:1px solid var(--line);border-radius:9px;padding:11px 12px;color:var(--text);font:inherit"><option value="all">全ステータス</option><option value="2">2xx</option><option value="3">3xx</option><option value="4">4xx</option><option value="5">5xx</option></select><span class="small" id="eventFilterCount" style="align-self:center">最新50件</span></div><div class="tablewrap"><table><thead><tr><th>時刻 (UTC)</th><th>分類</th><th>メソッド</th><th>パス</th><th>HTTP</th><th>応答時間</th><th>タグ</th></tr></thead><tbody id="events"><tr><td colspan="7" class="empty">イベントを取得しています…</td></tr></tbody></table></div></section>
 <footer><span>MK Honeypot · Public dashboard</span><span>5秒ごとに更新 · 公開表示用に匿名化</span></footer></div></div>
 </main>
@@ -702,10 +723,11 @@ function renderBehavior(b,bursts){const items=[{name:'直近1時間のユニー�
 function renderThreatSignals(items){const names={'Exploitパターン候補':'不審な文字列など既知パターンとの一致','既知スキャンパス候補':'よく探索される設定・管理パス','非読み取りHTTPメソッド':'GET/HEAD/OPTIONS以外のメソッド','スキャナー候補':'複数のスキャン兆候を含む分類','検索クローラー申告':'User-Agent上の検索クローラー申告','ログイン試行':'偽ログイン画面への送信イベント','サーバーエラー':'HTTP 5xx応答','管理パス探索候補':'管理画面や設定パスへのアクセス'};renderRankList('threatSignalList',items,x=>x.signal+' — '+(names[x.signal]||'観測パターン'),x=>x.count,'amber')}
 async function refreshHealth(){const api=document.getElementById('healthApi'),db=document.getElementById('healthDb');try{const r=await fetch('/api/dashboard/health',{cache:'no-store'});if(!r.ok)throw Error('health');const h=await r.json();api.textContent=h.status==='ok'?'正常':'要確認';api.style.color=h.status==='ok'?'var(--green)':'var(--red)';db.textContent=h.database==='online'?'接続正常':'接続不可';db.style.color=h.database==='online'?'var(--green)':'var(--red)';const hp=document.getElementById('healthHoneypot');hp.textContent=h.honeypot==='online'?'応答正常':'応答なし';hp.style.color=h.honeypot==='online'?'var(--green)':'var(--red)';document.getElementById('healthEvents').textContent=Number(h.events_5m).toLocaleString();document.getElementById('healthLast').textContent=h.last_event?new Date(h.last_event).toLocaleTimeString('ja-JP',{timeZone:'UTC'}):'未記録';document.getElementById('healthAge').textContent=h.seconds_since_last_event==null?'イベントはまだありません':h.seconds_since_last_event<60?'最終イベントから1分未満':Math.floor(h.seconds_since_last_event/60)+' 分前';document.getElementById('healthChecked').textContent='最終確認 '+new Date(h.checked_at).toLocaleTimeString('ja-JP')+' · この表示はDashboardとDBの簡易チェックです。Honeypot本体の完全な稼働保証ではありません。'}catch(e){api.textContent='確認失敗';api.style.color='var(--red)';db.textContent='状態不明';db.style.color='var(--amber)';document.getElementById('healthChecked').textContent='ヘルスAPIに接続できません。Dashboardの稼働状況を確認してください。'}}
 function renderCorrelations(items){renderRankList('pathCorrelationRanking',items||[],x=>x.path+' · '+x.signal_types+'種のシグナル',x=>x.hits+'件 / シグナル '+x.signal_hits,'amber')}
+function renderBotProfiles(items){const root=document.getElementById('botProfiles');root.replaceChildren();if(!items||!items.length){const e=document.createElement('div');e.className='empty';e.textContent='同じ仮名キーで3件以上のイベントはまだありません';root.append(e);return}for(const x of items){const row=document.createElement('div');row.className='category-row';const name=document.createElement('span');name.textContent=x.label+' · '+Number(x.unique_paths).toLocaleString()+' パス';const count=document.createElement('b');count.textContent=Number(x.hits).toLocaleString()+' 件 / シグナル '+Number(x.signal_hits).toLocaleString();row.append(name,count);const meta=document.createElement('div');meta.className='hint';meta.textContent='初回 '+fmtTime(x.first_seen)+' UTC · 最終 '+fmtTime(x.last_seen)+' UTC';root.append(row,meta)}}
 function renderProtocol(a){const l=a.latency||{};document.getElementById('latencyP50').textContent=l.p50_ms==null?'—':l.p50_ms.toLocaleString()+' ms';document.getElementById('latencyP95').textContent=l.p95_ms==null?'—':l.p95_ms.toLocaleString()+' ms';document.getElementById('latencyMax').textContent=l.max_ms==null?'—':l.max_ms.toLocaleString()+' ms';document.getElementById('latencySamples').textContent='計測サンプル '+Number(l.samples||0).toLocaleString();renderRankList('methodRanking',a.methods||[],x=>x.method,x=>x.count);renderRankList('statusFamilyRanking',a.status_families||[],x=>x.family,x=>x.count);renderPayloadSignals(a.payload_signals||[]);renderBehavior(a.behavior||{},a.burst_paths||[]);renderCorrelations(a.path_correlations||[]);renderDaily(a.daily_30d||[]);renderRankList('countryTrend',a.country_counts_7d||[],x=>x.country,x=>x.count)}
 function renderAlert(a){const box=document.getElementById('alertBanner'),dot=document.getElementById('alertDot');const triggered=!!a.triggered;box.classList.toggle('triggered',triggered);dot.className='status-dot'+(triggered?' fail':'');document.getElementById('alertState').textContent=triggered?'SPIKE DETECTED':'NORMAL';document.getElementById('alertTitle').textContent=triggered?'アクセス急増を検知しました':'アクセス急増は検知されていません';document.getElementById('alertDetail').textContent='直近5分 '+Number(a.recent_5m).toLocaleString()+' 件 · 過去55分の5分換算平均 '+Number(a.baseline_per_5m).toLocaleString()+' 件'+(triggered?' · 通常より大きく増加':' · 閾値に達していません')}
 
-async function refreshAnalytics(){try{const r=await fetch('/api/dashboard/analytics',{cache:'no-store'});if(!r.ok)throw Error('analytics api');const a=await r.json();document.getElementById('lastHour').textContent=Number(a.last_hour).toLocaleString();document.getElementById('errors24').textContent=Number(a.errors_24h).toLocaleString();document.getElementById('scanner24').textContent=Number(a.scanner_candidates_24h).toLocaleString();renderTrend(a.series||[]);renderCategories(a.categories||[]);renderRankList('pathRanking',a.top_paths||[],x=>x.path,x=>x.count);renderRankList('statusRanking',a.statuses||[],x=>'HTTP '+x.status_code,x=>x.count);renderTimeline(a.timeline||[]);renderThreatSignals(a.threat_signals||[]);renderProtocol(a);renderAlert(a.alert||{});}catch(e){document.getElementById('trendHint').textContent='分析データを取得できません';}}
+async function refreshAnalytics(){try{const r=await fetch('/api/dashboard/analytics',{cache:'no-store'});if(!r.ok)throw Error('analytics api');const a=await r.json();document.getElementById('lastHour').textContent=Number(a.last_hour).toLocaleString();document.getElementById('errors24').textContent=Number(a.errors_24h).toLocaleString();document.getElementById('scanner24').textContent=Number(a.scanner_candidates_24h).toLocaleString();renderTrend(a.series||[]);renderCategories(a.categories||[]);renderRankList('pathRanking',a.top_paths||[],x=>x.path,x=>x.count);renderRankList('statusRanking',a.statuses||[],x=>'HTTP '+x.status_code,x=>x.count);renderTimeline(a.timeline||[]);renderThreatSignals(a.threat_signals||[]);renderProtocol(a);renderBotProfiles(a.bot_profiles||[]);renderAlert(a.alert||{});}catch(e){document.getElementById('trendHint').textContent='分析データを取得できません';}}
 
 async function refreshGeo(){try{
  const r=await fetch('/api/dashboard/geo',{cache:'no-store'});if(!r.ok)throw Error('geo api');
@@ -729,7 +751,7 @@ async function refreshGeo(){try{
 let eventRows=[];
 function applyEventFilters(){const q=(document.getElementById('eventSearch')?.value||'').trim().toLowerCase(),status=document.getElementById('eventStatusFilter')?.value||'all';let visible=0;for(const tr of document.querySelectorAll('#events tr[data-search]')){const matchesText=!q||tr.dataset.search.includes(q);const matchesStatus=status==='all'||String(tr.dataset.status).startsWith(status);const show=matchesText&&matchesStatus;tr.hidden=!show;if(show)visible++}const count=document.getElementById('eventFilterCount');if(count)count.textContent=visible+'件表示 / '+eventRows.length+'件'}
 document.addEventListener('input',e=>{if(e.target.id==='eventSearch')applyEventFilters()});document.addEventListener('change',e=>{if(e.target.id==='eventStatusFilter')applyEventFilters()});
-function initNavigation(){const titles={overview:['概要','ライブ観測の主要指標と急増アラート'],traffic:['通信・トレンド','HTTP応答、時間推移、長期統計'],threats:['脅威分析','パターン候補、反復行動、シグナル相関'],geography:['世界地図','地域別に集約されたアクセス観測'],system:['システム稼働','Dashboard・DB・Honeypotのヘルス状態'],events:['イベント検索','直近イベントをパス・分類・HTTPステータスで絞り込み']};document.querySelector('.page-content>.grid')?.setAttribute('data-page','overview');for(const section of document.querySelectorAll('.page-content section')){const h=section.querySelector('h2')?.textContent||'';let page='overview';if(h.includes('システム稼働'))page='system';else if(h.includes('イベントタイムライン')||h.includes('HTTP・通信')||h.includes('長期傾向'))page='traffic';else if(h.includes('脅威シグナル')||h.includes('不審ペイロード')||h.includes('観測された侵入経路'))page='threats';else if(h.includes('アクセス元マップ'))page='geography';else if(h.includes('最新イベント'))page='events';section.dataset.page=page}function show(page){document.querySelectorAll('.page-content section').forEach(el=>el.hidden=el.dataset.page!==page);const grid=document.querySelector('.page-content>.grid');if(grid)grid.hidden=page!=='overview';document.querySelectorAll('[data-page-link]').forEach(btn=>{const active=btn.dataset.pageLink===page;btn.classList.toggle('active',active);btn.setAttribute('aria-current',active?'page':'false')});let head=document.getElementById('pageTitle');if(!head){head=document.createElement('div');head.id='pageTitle';head.className='page-title';document.querySelector('.page-content>.notice')?.after(head)}head.innerHTML='<div><h2>'+titles[page][0]+'</h2><p>'+titles[page][1]+'</p></div><span class="status-pill"><span class="status-dot"></span>LIVE</span>';history.replaceState(null,'','#'+page)}document.querySelectorAll('[data-page-link]').forEach(btn=>btn.addEventListener('click',()=>show(btn.dataset.pageLink)));const initial=location.hash.slice(1);show(titles[initial]?initial:'overview')}
+function initNavigation(){const titles={overview:['概要','ライブ観測の主要指標と急増アラート'],traffic:['通信・トレンド','HTTP応答、時間推移、長期統計'],threats:['脅威分析','パターン候補、反復行動、シグナル相関'],geography:['世界地図','地域別に集約されたアクセス観測'],system:['システム稼働','Dashboard・DB・Honeypotのヘルス状態'],events:['イベント検索','直近イベントをパス・分類・HTTPステータスで絞り込み']};document.querySelector('.page-content>.grid')?.setAttribute('data-page','overview');for(const section of document.querySelectorAll('.page-content section')){const h=section.querySelector('h2')?.textContent||'';let page='overview';if(h.includes('システム稼働'))page='system';else if(h.includes('イベントタイムライン')||h.includes('HTTP・通信')||h.includes('長期傾向'))page='traffic';else if(h.includes('Bot 行動プロファイル')||h.includes('脅威シグナル')||h.includes('不審ペイロード')||h.includes('観測された侵入経路'))page='threats';else if(h.includes('アクセス元マップ'))page='geography';else if(h.includes('最新イベント'))page='events';section.dataset.page=page}function show(page){document.querySelectorAll('.page-content section').forEach(el=>el.hidden=el.dataset.page!==page);const grid=document.querySelector('.page-content>.grid');if(grid)grid.hidden=page!=='overview';document.querySelectorAll('[data-page-link]').forEach(btn=>{const active=btn.dataset.pageLink===page;btn.classList.toggle('active',active);btn.setAttribute('aria-current',active?'page':'false')});let head=document.getElementById('pageTitle');if(!head){head=document.createElement('div');head.id='pageTitle';head.className='page-title';document.querySelector('.page-content>.notice')?.after(head)}head.innerHTML='<div><h2>'+titles[page][0]+'</h2><p>'+titles[page][1]+'</p></div><span class="status-pill"><span class="status-dot"></span>LIVE</span>';history.replaceState(null,'','#'+page)}document.querySelectorAll('[data-page-link]').forEach(btn=>btn.addEventListener('click',()=>show(btn.dataset.pageLink)));const initial=location.hash.slice(1);show(titles[initial]?initial:'overview')}
 async function refresh(){try{
  const [s,e]=await Promise.all([fetch('/api/dashboard/summary',{cache:'no-store'}),fetch('/api/dashboard/events?limit=50',{cache:'no-store'})]);
  if(!s.ok||!e.ok)throw Error('API error');const a=await s.json(),b=await e.json();
