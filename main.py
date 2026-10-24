@@ -542,6 +542,62 @@ section{margin-top:28px}.sectionhead{display:flex;align-items:baseline;justify-c
 .status-dot{animation:status-breathe 2.4s ease-in-out infinite}
 @keyframes status-breathe{0%,100%{opacity:1}50%{opacity:.58}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.01ms!important}}
+
+/* SOC command-center visual system */
+:root{--bg:#070c15;--panel:#101a2a;--line:#25354b;--muted:#91a4bd;--text:#eaf1fb;--green:#57e6a7;--amber:#ffca70;--red:#ff6f7d;--cyan:#63dff4}
+body{background-color:var(--bg);background-image:radial-gradient(ellipse at 14% -8%,#17324a 0,transparent 42%),linear-gradient(#10203522 1px,transparent 1px),linear-gradient(90deg,#10203522 1px,transparent 1px);background-size:auto,32px 32px,32px 32px;background-attachment:fixed}
+main{max-width:1580px;padding-top:26px}
+.top{border-bottom-color:#2b4059;padding-bottom:20px}
+.mark{background:linear-gradient(145deg,#142d39,#0c1725);border-color:#32604f;box-shadow:inset 0 0 18px #57e6a70b}
+.brand h1{letter-spacing:.045em}
+.sub{letter-spacing:.045em}
+.live{background:#10271f;box-shadow:inset 0 0 12px #57e6a70a;font-weight:700;letter-spacing:.06em}
+.live:before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);margin:0 7px 1px 0;box-shadow:0 0 9px #57e6a7}
+.workspace{grid-template-columns:228px minmax(0,1fr);gap:18px}
+.sidebar{background:linear-gradient(180deg,#0d1726,#09111d);border-color:#263a52;box-shadow:0 14px 36px #00000018}
+.sidebar-label{font-weight:700;color:#7189a5}
+.nav-item{border-radius:8px;min-height:42px}
+.nav-item.active{background:linear-gradient(90deg,#15372f,#102b2b);border-color:#2d6957;box-shadow:inset 3px 0 0 var(--green);font-weight:650}
+.page-title{border-bottom:1px solid #22334a;padding:0 0 14px}
+.page-title h2{font-size:21px;letter-spacing:.015em}
+.page-title p{letter-spacing:.015em}
+.page-title .status-pill{background:#0d201c;border-color:#285442;color:var(--green);font-weight:700;letter-spacing:.04em}
+.card{position:relative;overflow:hidden;background:linear-gradient(145deg,#142136,#0d1726 78%);border-color:#293b53;border-radius:12px;box-shadow:0 8px 26px #00000012}
+.card:before{content:"";position:absolute;left:0;top:0;right:0;height:2px;background:linear-gradient(90deg,#57e6a7,#63dff4 58%,transparent);opacity:.72}
+.grid .card:nth-child(2):before{background:linear-gradient(90deg,#ffca70,#ff8c73,transparent)}
+.grid .card:nth-child(3):before{background:linear-gradient(90deg,#ff6f7d,#ffca70,transparent)}
+.grid .card:nth-child(4):before{background:linear-gradient(90deg,#63dff4,#688fff,transparent)}
+.value{font-variant-numeric:tabular-nums}
+.label{font-size:11px;font-weight:750;letter-spacing:.075em;text-transform:uppercase}
+.hint{line-height:1.65}
+section{margin-top:26px}
+.sectionhead{padding-bottom:9px;border-bottom:1px solid #1d2c40}
+.sectionhead h2{letter-spacing:.015em}
+.tablewrap,.chartbox,.mapbox{border-color:#293b53;box-shadow:0 8px 26px #00000010}
+table{font-variant-numeric:tabular-nums}
+th{font-size:11px;letter-spacing:.055em;text-transform:uppercase;background:#111e30}
+tbody tr{transition:background-color .15s ease}
+tbody tr:hover{background:#132238}
+td{border-bottom-color:#1b2a3d}
+.badge{border:1px solid #29425d}
+.badge.warn{border-color:#664b2b}
+.badge.fail{border-color:#66303b}
+.stage,.metric-mini,.health-item{background:linear-gradient(145deg,#101c2d,#0b1421);border-color:#293b53}
+.stage-num{font-weight:750}
+.chartbox{background:linear-gradient(145deg,#0d1828,#09121f)}
+.chart-grid{stroke:#24354b}
+.chart-line{stroke:var(--cyan);filter:drop-shadow(0 0 4px #63dff433)}
+.rank-fill{background:linear-gradient(90deg,#2b98b4,#57e6a7)}
+.rank-track{background:#1a293d}
+.alert-banner{box-shadow:inset 3px 0 0 var(--green)}
+.alert-banner.triggered{box-shadow:inset 3px 0 0 var(--red)}
+.status-pill{background:#101b2a}
+.status-dot{box-shadow:0 0 10px currentColor}
+footer{border-top:1px solid #1e2d42;padding-top:16px}
+:focus-visible{outline:2px solid var(--cyan);outline-offset:3px}
+@media(max-width:850px){.workspace{grid-template-columns:1fr}.sidebar{background:#0b1422}.page-title{padding-bottom:12px}}
+@media(prefers-reduced-motion:reduce){body{background-attachment:scroll}}
+
 </style></head><body><main>
 <header class="top"><div class="brand"><div class="mark">H</div><div><h1>MK Honeypot</h1><div class="sub">PUBLIC SECURITY OBSERVABILITY · LIVE EVENT FEED</div></div></div><div class="live">● 公開モニター</div></header>
 <div class="workspace"><aside class="sidebar" aria-label="ダッシュボードのページ"><div class="sidebar-label">OBSERVABILITY</div><button class="nav-item active" data-page-link="overview"><span class="nav-icon">⌂</span>概要</button><button class="nav-item" data-page-link="traffic"><span class="nav-icon">⌁</span>通信・トレンド</button><button class="nav-item" data-page-link="threats"><span class="nav-icon">◈</span>脅威分析</button><button class="nav-item" data-page-link="geography"><span class="nav-icon">◎</span>世界地図</button><button class="nav-item" data-page-link="system"><span class="nav-icon">▣</span>システム稼働</button><button class="nav-item" data-page-link="events"><span class="nav-icon">≡</span>イベント検索</button></aside><div class="page-content"><div class="notice">公開観測ダッシュボードです。IPアドレス・生のUser-Agent・認証情報は表示しません。地図は位置情報を約10度単位で集約し、複数イベントがある領域のみ表示します。「スキャナー候補」などの分類はアクセスパターンに基づく推定で、発信元の身元を確認したものではありません。アクセスの観測は侵入成功を意味しません。</div>
