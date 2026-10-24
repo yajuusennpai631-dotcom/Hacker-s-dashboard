@@ -167,10 +167,19 @@ async def summary():
 @app.get("/api/dashboard/geo")
 async def geo_events():
     async with app.state.pool.acquire() as conn:
+        # Public map uses coarse 10-degree cells, aggregated across events.
+        # Do not expose city names, individual event timestamps, or exact coordinates.
         rows = await conn.fetch("""
-          SELECT id, occurred_at, geo_country, geo_city, geo_lat, geo_lon
-          FROM events WHERE geo_lat IS NOT NULL AND geo_lon IS NOT NULL
-          ORDER BY occurred_at DESC LIMIT 200
+          SELECT MIN(id) AS id, MAX(geo_country) AS geo_country,
+                 ROUND(AVG(geo_lat) / 10.0) * 10.0 AS geo_lat,
+                 ROUND(AVG(geo_lon) / 10.0) * 10.0 AS geo_lon,
+                 COUNT(*) AS event_count
+          FROM events
+          WHERE geo_lat IS NOT NULL AND geo_lon IS NOT NULL
+          GROUP BY geo_country, ROUND(geo_lat / 10.0), ROUND(geo_lon / 10.0)
+          HAVING COUNT(*) >= 2
+          ORDER BY COUNT(*) DESC
+          LIMIT 100
         """)
         countries = await conn.fetch("""
           SELECT geo_country AS country, COUNT(*) AS count FROM events
@@ -178,9 +187,9 @@ async def geo_events():
           ORDER BY count DESC LIMIT 12
         """)
     return {
-        "points": [{"id": r["id"], "timestamp": r["occurred_at"].isoformat(),
-                    "country": r["geo_country"], "city": r["geo_city"],
-                    "lat": r["geo_lat"], "lon": r["geo_lon"]} for r in rows],
+        "points": [{"id": r["id"], "country": r["geo_country"],
+                    "lat": float(r["geo_lat"]), "lon": float(r["geo_lon"]),
+                    "count": r["event_count"]} for r in rows],
         "countries": [{"country": r["country"], "count": r["count"]} for r in countries]
     }
 
@@ -212,8 +221,8 @@ async def home():
 
 PAGE = r"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="description" content="Hacker Trap 公開セキュリティ観測ダッシュボード">
-<title>Hacker Trap — Public Monitor</title>
+<meta name="description" content="MK Honeypot — 公開ハニーポット観測ダッシュボード。匿名化・集計したアクセス傾向を公開します。">
+<title>MK Honeypot — Public Monitor</title>
 <style>
 :root{color-scheme:dark;--bg:#080d18;--panel:#111a2b;--line:#24324a;--muted:#91a2bb;--text:#e8eef9;--green:#56e39f;--amber:#ffca70;--red:#ff6e7a}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 15% 0,#172642 0,transparent 42%),var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -228,8 +237,8 @@ section{margin-top:28px}.sectionhead{display:flex;align-items:baseline;justify-c
 .maplayout{display:grid;grid-template-columns:minmax(0,2fr) minmax(210px,1fr);gap:14px}.mapbox{overflow:hidden;background:radial-gradient(ellipse at center,#12243a,#08111e 78%);border:1px solid var(--line);border-radius:12px;min-height:300px}#worldmap{display:block;width:100%;height:auto;min-height:300px}.land{fill:#244563;stroke:#496b8b;stroke-width:.65;stroke-linejoin:round}.borders{fill:none;stroke:#375673;stroke-width:.48;pointer-events:none}.mapgrid{stroke:#1a2b40;stroke-width:1;fill:none}.geo-point{fill:#59e6aa;stroke:#b8ffe0;stroke-width:1.5;cursor:pointer}.pulse{fill:none;stroke:#59e6aa;stroke-width:2;transform-box:fill-box;transform-origin:center;animation:pulse 2.2s ease-out infinite}@keyframes pulse{0%{opacity:.9;transform:scale(.4)}100%{opacity:0;transform:scale(3.8)}}.countrylist{display:flex;flex-direction:column;gap:8px}.countryrow{display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid var(--line);padding:8px 0;font-size:13px}.countryrow b{color:var(--green)}footer{margin-top:28px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 @media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.pathway{grid-template-columns:repeat(2,minmax(0,1fr))}.maplayout{grid-template-columns:1fr}}@media(max-width:480px){main{padding:20px 12px 36px}.grid{gap:9px}.card{padding:13px}.top{align-items:flex-start}.live{font-size:11px}}
 </style></head><body><main>
-<header class="top"><div class="brand"><div class="mark">H</div><div><h1>Hacker Trap</h1><div class="sub">PUBLIC SECURITY OBSERVABILITY · LIVE EVENT FEED</div></div></div><div class="live">● 公開モニター</div></header>
-<div class="notice">公開ダッシュボードです。プライバシー保護のため、IPアドレス・ユーザーエージェント・認証情報は表示しません。ここでの「ノック」はアクセスの観測を意味し、侵入成功を意味しません。</div>
+<header class="top"><div class="brand"><div class="mark">H</div><div><h1>MK Honeypot</h1><div class="sub">PUBLIC SECURITY OBSERVABILITY · LIVE EVENT FEED</div></div></div><div class="live">● 公開モニター</div></header>
+<div class="notice">公開観測ダッシュボードです。IPアドレス・生のUser-Agent・認証情報は表示しません。地図は位置情報を約10度単位で集約し、複数イベントがある領域のみ表示します。「スキャナー候補」などの分類はアクセスパターンに基づく推定で、発信元の身元を確認したものではありません。アクセスの観測は侵入成功を意味しません。</div>
 <div class="grid">
 <article class="card"><div class="label">総アクセス（観測）</div><div class="value" id="knocks">—</div><div class="hint">記録されたHTTPリクエスト</div></article>
 <article class="card"><div class="label">パスワード試行</div><div class="value amber" id="passwords">—</div><div class="hint">偽ログイン画面への送信回数</div></article>
@@ -237,12 +246,12 @@ section{margin-top:28px}.sectionhead{display:flex;align-items:baseline;justify-c
 <article class="card"><div class="label">直近24時間のイベント</div><div class="value green" id="last24">—</div><div class="hint">保存された全イベント</div></article>
 </div>
 <section><div class="sectionhead"><h2>侵入状況</h2><span class="small">判定の限界</span></div><div class="card"><div class="value amber" style="font-size:20px">実侵入：判定対象外</div><div class="hint" id="intrusionNote">この囮アプリは本物の内部システムを公開していないため、実侵入の成功を判定できません。</div></div></section>
-<section><div class="sectionhead"><h2>アクセス元マップ</h2><span class="small">IPベースの概算位置・5秒ごとに更新</span></div>
+<section><div class="sectionhead"><h2>アクセス元マップ</h2><span class="small">約10度単位の集約位置・5秒ごとに更新</span></div>
 <div class="maplayout"><div class="mapbox"><svg id="worldmap" viewBox="0 0 1000 500" role="img" aria-label="アクセス元の概算位置を示す世界地図">
 <g class="mapgrid"><path d="M0 100H1000 M0 200H1000 M0 300H1000 M0 400H1000 M200 0V500 M400 0V500 M600 0V500 M800 0V500"/></g>
 <g id="world-land" class="land"></g><path id="country-borders" class="borders" d=""/><g id="geo-points"></g></svg></div>
-<div class="card"><h2>アクセス元の国・地域</h2><div class="hint" style="margin-bottom:10px">直近の位置情報付きイベント</div><div id="countries" class="countrylist"><div class="empty">位置情報を待っています…</div></div><div class="hint" style="margin-top:14px">位置はIPアドレスから推定した概算です。VPN、携帯回線、プロキシなどにより実際の所在地とは異なる場合があります。</div></div></div>
-<div class="hint" style="margin-top:8px">IPアドレスそのものは保存・公開しません。位置推定には外部のIPジオロケーションサービスを利用します。位置情報が取得できないイベントは地図に表示されません。</div></section>
+<div class="card"><h2>アクセス元の国・地域</h2><div class="hint" style="margin-bottom:10px">直近の位置情報付きイベント</div><div id="countries" class="countrylist"><div class="empty">位置情報を待っています…</div></div><div class="hint" style="margin-top:14px">地図の点は複数イベントをまとめた粗い位置区画です。個別イベントや正確な所在地を示すものではありません。</div></div></div>
+<div class="hint" style="margin-top:8px">IPアドレスそのものは公開しません。位置推定には外部のIPジオロケーションサービスを利用します。位置情報が取得できないイベントや、複数件に満たない位置区画は地図に表示されません。</div></section>
 <section><div class="sectionhead"><h2>観測された侵入経路</h2><span class="small">各段階の累計・同一人物の追跡ではありません</span></div><div class="pathway">
 <div class="stage"><div class="stage-num">STEP 01</div><div class="stage-name">偵察・トップページ</div><div class="stage-count" id="recon">—</div><div class="stage-arrow">アクセス観測</div></div>
 <div class="stage"><div class="stage-num">STEP 02</div><div class="stage-name">ログイン画面</div><div class="stage-count" id="loginViews">—</div><div class="stage-arrow">画面表示</div></div>
@@ -251,7 +260,7 @@ section{margin-top:28px}.sectionhead{display:flex;align-items:baseline;justify-c
 <div class="stage"><div class="stage-num">STEP 05</div><div class="stage-name">囮コンソール到達</div><div class="stage-count" id="decoyAccesses">—</div><div class="stage-arrow">/fake-shell · 実行機能なし</div></div>
 </div><div class="hint" style="margin-top:9px">これは段階別の累計です。プライバシー保護のため訪問者を識別・追跡しておらず、個々のアクセスがこの順番で進んだことを意味しません。</div></section>
 <section><div class="sectionhead"><h2>最新イベント</h2><span class="small" id="updated">読み込み中</span></div><div class="tablewrap"><table><thead><tr><th>時刻 (UTC)</th><th>分類</th><th>メソッド</th><th>パス</th><th>HTTP</th><th>タグ</th></tr></thead><tbody id="events"><tr><td colspan="6" class="empty">イベントを取得しています…</td></tr></tbody></table></div></section>
-<footer><span>Hacker Trap · Public dashboard</span><span>5秒ごとに更新 · 公開表示用に匿名化</span></footer>
+<footer><span>MK Honeypot · Public dashboard</span><span>5秒ごとに更新 · 公開表示用に匿名化</span></footer>
 </main>
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script><script src="https://cdn.jsdelivr.net/npm/topojson-client@3"></script><script>
 let mapProjection=null;
@@ -266,8 +275,8 @@ async function refreshGeo(){try{
  for(const p of (data.points||[])){const q=project(p.lon,p.lat);if(q.x<0||q.x>1000||q.y<0||q.y>500)continue;
  const g=document.createElementNS('http://www.w3.org/2000/svg','g');g.setAttribute('transform','translate('+q.x+','+q.y+')');
  const pulse=document.createElementNS('http://www.w3.org/2000/svg','circle');pulse.setAttribute('r','4');pulse.setAttribute('class','pulse');g.append(pulse);
- const dot=document.createElementNS('http://www.w3.org/2000/svg','circle');dot.setAttribute('r','3.5');dot.setAttribute('class','geo-point');
- const title=document.createElementNS('http://www.w3.org/2000/svg','title');title.textContent=[p.city,p.country,fmtTime(p.timestamp)].filter(Boolean).join(' · ');dot.append(title);g.append(dot);layer.append(g);}
+ const dot=document.createElementNS('http://www.w3.org/2000/svg','circle');dot.setAttribute('r',String(Math.min(8,3+Math.log2(Number(p.count)||1))));dot.setAttribute('class','geo-point');
+ const title=document.createElementNS('http://www.w3.org/2000/svg','title');title.textContent=[p.country,Number(p.count).toLocaleString()+' events (aggregated)'].filter(Boolean).join(' · ');dot.append(title);g.append(dot);layer.append(g);}
  const list=document.getElementById('countries');list.replaceChildren();
  if(!(data.countries||[]).length){const e=document.createElement('div');e.className='empty';e.textContent='まだ位置情報付きイベントはありません';list.append(e)}
  for(const item of (data.countries||[])){const row=document.createElement('div');row.className='countryrow';const name=document.createElement('span');name.textContent=item.country;const count=document.createElement('b');count.textContent=Number(item.count).toLocaleString();row.append(name,count);list.append(row)}
