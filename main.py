@@ -325,6 +325,26 @@ async def analytics():
             AND occurred_at >= NOW() - INTERVAL '7 days' AND path <> '/health'
           GROUP BY geo_country ORDER BY count DESC LIMIT 10
         """)
+        path_behavior = await conn.fetchrow("""
+          SELECT
+            COUNT(*) FILTER (WHERE hits_1h >= 5) AS repeated_paths_1h,
+            COUNT(*) FILTER (WHERE hits_5m >= 3) AS burst_paths_5m,
+            COUNT(*) FILTER (WHERE hits_1h >= 1) AS unique_paths_1h
+          FROM (
+            SELECT path,
+              COUNT(*) FILTER (WHERE occurred_at >= NOW() - INTERVAL '1 hour') AS hits_1h,
+              COUNT(*) FILTER (WHERE occurred_at >= NOW() - INTERVAL '5 minutes') AS hits_5m
+            FROM events
+            WHERE occurred_at >= NOW() - INTERVAL '1 hour' AND path <> '/health'
+            GROUP BY path
+          ) p
+        """)
+        burst_paths = await conn.fetch("""
+          SELECT path, COUNT(*) AS count FROM events
+          WHERE occurred_at >= NOW() - INTERVAL '5 minutes' AND path <> '/health'
+          GROUP BY path HAVING COUNT(*) >= 3
+          ORDER BY count DESC, path ASC LIMIT 8
+        """)
         behavior = await conn.fetch("""
           SELECT COUNT(*) FILTER (WHERE 'signal:non_read_method' = ANY(tags)) AS non_read_methods,
                  COUNT(*) FILTER (WHERE 'signal:common_scan_path' = ANY(tags)) AS common_scan_paths,
@@ -352,7 +372,8 @@ async def analytics():
         "payload_signals": [{"signal": r["signal"], "count": r["count"]} for r in payload_signals],
         "daily_30d": [{"day": r["day"].date().isoformat(), "total": r["total"], "errors": r["errors"], "scanner_candidates": r["scanner_candidates"]} for r in daily_30d],
         "country_counts_7d": [{"country": r["country"], "count": r["count"]} for r in country_counts_7d],
-        "behavior": {k: int(behavior[k] or 0) for k in ("non_read_methods", "common_scan_paths", "exploit_candidates", "client_errors", "server_errors")},
+        "behavior": {**{k: int(behavior[k] or 0) for k in ("non_read_methods", "common_scan_paths", "exploit_candidates", "client_errors", "server_errors")}, "repeated_paths_1h": int(path_behavior["repeated_paths_1h"] or 0), "burst_paths_5m": int(path_behavior["burst_paths_5m"] or 0), "unique_paths_1h": int(path_behavior["unique_paths_1h"] or 0)},
+        "burst_paths": [{"path": r["path"], "count": r["count"]} for r in burst_paths],
         "last_hour": totals["last_hour"],
         "errors_24h": totals["errors_24h"],
         "scanner_candidates_24h": totals["scanner_candidates_24h"],
@@ -519,10 +540,10 @@ section{margin-top:28px}.sectionhead{display:flex;align-items:baseline;justify-c
 </div>
 <div class="hint" style="margin-top:8px">応答時間はアプリケーションのリクエスト処理にかかった概算値で、クライアントから見た全ネットワーク遅延ではありません。</div>
 </section>
-<section><div class="sectionhead"><h2>不審ペイロード分類</h2><span class="small">直近24時間 · 内容は保存・公開しない</span></div>
+<section><div class="sectionhead"><h2>不審ペイロード分類</h2><span class="small">直近24時間 · URL/クエリの分類のみ</span></div>
 <div class="analytics-grid">
-<div class="card"><div id="payloadRanking" class="rank-list"></div><div class="signal-explain">SQLインジェクション、パストラバーサル、XSS、コマンド注入、機密パス探索のパターン候補を集計。文字列そのものやリクエスト本文は記録・表示しません。</div></div>
-<div class="card"><h2>行動シグナル</h2><div id="behaviorRanking" class="rank-list"></div><div class="signal-explain">集計は観測したリクエストの分類に基づきます。スキャンの意図や侵入成功を断定しません。</div></div>
+<div class="card"><div id="payloadRanking" class="rank-list"></div><div class="signal-explain">URLパスとクエリに含まれるパターンから、SQLインジェクション、パストラバーサル、XSS、コマンド注入、機密パス探索の候補を集計。生のクエリ値・リクエスト本文は記録・表示せず、本文内容の解析もしません。</div></div>
+<div class="card"><h2>行動シグナル</h2><div id="behaviorRanking" class="rank-list"></div><div class="signal-explain">集計は観測したリクエストの分類に基づきます。スキャンの意図や侵入成功を断定しません。</div><h2 style="margin-top:18px">直近5分の反復パス</h2><div id="burstPathRanking" class="rank-list"></div></div>
 </div></section>
 <section><div class="sectionhead"><h2>長期傾向・地域別推移</h2><span class="small">直近30日 / 地域集計は7日間</span></div>
 <div class="analytics-grid">
@@ -566,10 +587,10 @@ function renderTrend(series){const W=760,H=250,left=38,right=16,top=18,bottom=36
 function renderTimeline(items){const bars=document.getElementById('timelineBars'),list=document.getElementById('timelineList');bars.replaceChildren();list.replaceChildren();const max=Math.max(1,...items.map(x=>Number(x.total)||0));const total=items.reduce((s,x)=>s+(Number(x.total)||0),0);for(const item of items){const bar=document.createElement('div');bar.className='timeline-bar';bar.style.height=Math.max(3,(Number(item.total)||0)/max*44)+'px';bar.title=fmtTime(item.time)+' UTC · '+item.total+' 件';bars.append(bar)}document.getElementById('timelineTotal').textContent='合計 '+total.toLocaleString()+' 件';const nonzero=items.filter(x=>Number(x.total)>0).slice(-12).reverse();if(!nonzero.length){const e=document.createElement('div');e.className='empty';e.textContent='直近24時間にイベントはありません';list.append(e);return}for(const item of nonzero){const row=document.createElement('div');row.className='timeline-row';const time=document.createElement('div');time.className='timeline-time';time.textContent=new Date(item.time).toLocaleString('ja-JP',{timeZone:'UTC',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});const pin=document.createElement('div');pin.className='timeline-pin'+(Number(item.errors)>0?' fail':Number(item.scanner_candidates)>0||Number(item.login_attempts)>0?' warn':'');const desc=document.createElement('div');desc.textContent='イベント '+Number(item.total).toLocaleString()+' 件 · エラー '+Number(item.errors).toLocaleString()+' · スキャナー候補 '+Number(item.scanner_candidates).toLocaleString()+' · ログイン試行 '+Number(item.login_attempts).toLocaleString();const count=document.createElement('div');count.className='timeline-count';count.textContent=Number(item.total).toLocaleString()+' 件';row.append(time,pin,desc,count);list.append(row)}}
 function renderPayloadSignals(items){const labels={'payload:sql_injection_candidate':'SQLインジェクション候補','payload:path_traversal_candidate':'パストラバーサル候補','payload:xss_candidate':'XSS候補','payload:command_injection_candidate':'コマンド注入候補','payload:sensitive_path_candidate':'機密パス探索候補'};renderRankList('payloadRanking',items,x=>labels[x.signal]||'その他の分類候補',x=>x.count,'amber')}
 function renderDaily(items){const root=document.getElementById('dailyBars');root.replaceChildren();const max=Math.max(1,...items.map(x=>Number(x.total)||0));const total=items.reduce((s,x)=>s+(Number(x.total)||0),0);for(const item of items){const bar=document.createElement('div');bar.className='timeline-bar';bar.style.height=Math.max(2,(Number(item.total)||0)/max*90)+'px';bar.title=item.day+' · '+Number(item.total).toLocaleString()+'件 · 5xx '+Number(item.errors).toLocaleString();root.append(bar)}document.getElementById('dailyTotal').textContent='30日合計 '+total.toLocaleString()+' 件'}
-function renderBehavior(b){const items=[{name:'エクスプロイト候補',count:b.exploit_candidates},{name:'既知スキャンパス',count:b.common_scan_paths},{name:'非読み取りメソッド',count:b.non_read_methods},{name:'HTTP 4xx',count:b.client_errors},{name:'HTTP 5xx',count:b.server_errors}];renderRankList('behaviorRanking',items,x=>x.name,x=>x.count,'amber')}
+function renderBehavior(b,bursts){const items=[{name:'直近1時間のユニークパス',count:b.unique_paths_1h},{name:'5回以上反復したパス（1時間）',count:b.repeated_paths_1h},{name:'3回以上反復したパス（5分）',count:b.burst_paths_5m},{name:'エクスプロイト候補',count:b.exploit_candidates},{name:'既知スキャンパス',count:b.common_scan_paths},{name:'非読み取りメソッド',count:b.non_read_methods},{name:'HTTP 4xx',count:b.client_errors},{name:'HTTP 5xx',count:b.server_errors}];renderRankList('behaviorRanking',items,x=>x.name,x=>x.count,'amber');renderRankList('burstPathRanking',bursts||[],x=>x.path,x=>x.count,'amber')}
 function renderThreatSignals(items){const names={'Exploitパターン候補':'不審な文字列など既知パターンとの一致','既知スキャンパス候補':'よく探索される設定・管理パス','非読み取りHTTPメソッド':'GET/HEAD/OPTIONS以外のメソッド','スキャナー候補':'複数のスキャン兆候を含む分類','検索クローラー申告':'User-Agent上の検索クローラー申告','ログイン試行':'偽ログイン画面への送信イベント','サーバーエラー':'HTTP 5xx応答','管理パス探索候補':'管理画面や設定パスへのアクセス'};renderRankList('threatSignalList',items,x=>x.signal+' — '+(names[x.signal]||'観測パターン'),x=>x.count,'amber')}
 async function refreshHealth(){const api=document.getElementById('healthApi'),db=document.getElementById('healthDb');try{const r=await fetch('/api/dashboard/health',{cache:'no-store'});if(!r.ok)throw Error('health');const h=await r.json();api.textContent=h.status==='ok'?'正常':'要確認';api.style.color=h.status==='ok'?'var(--green)':'var(--red)';db.textContent=h.database==='online'?'接続正常':'接続不可';db.style.color=h.database==='online'?'var(--green)':'var(--red)';document.getElementById('healthEvents').textContent=Number(h.events_5m).toLocaleString();document.getElementById('healthLast').textContent=h.last_event?new Date(h.last_event).toLocaleTimeString('ja-JP',{timeZone:'UTC'}):'未記録';document.getElementById('healthAge').textContent=h.seconds_since_last_event==null?'イベントはまだありません':h.seconds_since_last_event<60?'最終イベントから1分未満':Math.floor(h.seconds_since_last_event/60)+' 分前';document.getElementById('healthChecked').textContent='最終確認 '+new Date(h.checked_at).toLocaleTimeString('ja-JP')+' · この表示はDashboardとDBの簡易チェックです。Honeypot本体の完全な稼働保証ではありません。'}catch(e){api.textContent='確認失敗';api.style.color='var(--red)';db.textContent='状態不明';db.style.color='var(--amber)';document.getElementById('healthChecked').textContent='ヘルスAPIに接続できません。Dashboardの稼働状況を確認してください。'}}
-function renderProtocol(a){const l=a.latency||{};document.getElementById('latencyP50').textContent=l.p50_ms==null?'—':l.p50_ms.toLocaleString()+' ms';document.getElementById('latencyP95').textContent=l.p95_ms==null?'—':l.p95_ms.toLocaleString()+' ms';document.getElementById('latencyMax').textContent=l.max_ms==null?'—':l.max_ms.toLocaleString()+' ms';document.getElementById('latencySamples').textContent='計測サンプル '+Number(l.samples||0).toLocaleString();renderRankList('methodRanking',a.methods||[],x=>x.method,x=>x.count);renderRankList('statusFamilyRanking',a.status_families||[],x=>x.family,x=>x.count);renderPayloadSignals(a.payload_signals||[]);renderBehavior(a.behavior||{});renderDaily(a.daily_30d||[]);renderRankList('countryTrend',a.country_counts_7d||[],x=>x.country,x=>x.count)}
+function renderProtocol(a){const l=a.latency||{};document.getElementById('latencyP50').textContent=l.p50_ms==null?'—':l.p50_ms.toLocaleString()+' ms';document.getElementById('latencyP95').textContent=l.p95_ms==null?'—':l.p95_ms.toLocaleString()+' ms';document.getElementById('latencyMax').textContent=l.max_ms==null?'—':l.max_ms.toLocaleString()+' ms';document.getElementById('latencySamples').textContent='計測サンプル '+Number(l.samples||0).toLocaleString();renderRankList('methodRanking',a.methods||[],x=>x.method,x=>x.count);renderRankList('statusFamilyRanking',a.status_families||[],x=>x.family,x=>x.count);renderPayloadSignals(a.payload_signals||[]);renderBehavior(a.behavior||{},a.burst_paths||[]);renderDaily(a.daily_30d||[]);renderRankList('countryTrend',a.country_counts_7d||[],x=>x.country,x=>x.count)}
 function renderAlert(a){const box=document.getElementById('alertBanner'),dot=document.getElementById('alertDot');const triggered=!!a.triggered;box.classList.toggle('triggered',triggered);dot.className='status-dot'+(triggered?' fail':'');document.getElementById('alertState').textContent=triggered?'SPIKE DETECTED':'NORMAL';document.getElementById('alertTitle').textContent=triggered?'アクセス急増を検知しました':'アクセス急増は検知されていません';document.getElementById('alertDetail').textContent='直近5分 '+Number(a.recent_5m).toLocaleString()+' 件 · 過去55分の5分換算平均 '+Number(a.baseline_per_5m).toLocaleString()+' 件'+(triggered?' · 通常より大きく増加':' · 閾値に達していません')}
 
 async function refreshAnalytics(){try{const r=await fetch('/api/dashboard/analytics',{cache:'no-store'});if(!r.ok)throw Error('analytics api');const a=await r.json();document.getElementById('lastHour').textContent=Number(a.last_hour).toLocaleString();document.getElementById('errors24').textContent=Number(a.errors_24h).toLocaleString();document.getElementById('scanner24').textContent=Number(a.scanner_candidates_24h).toLocaleString();renderTrend(a.series||[]);renderCategories(a.categories||[]);renderRankList('pathRanking',a.top_paths||[],x=>x.path,x=>x.count);renderRankList('statusRanking',a.statuses||[],x=>'HTTP '+x.status_code,x=>x.count);renderTimeline(a.timeline||[]);renderThreatSignals(a.threat_signals||[]);renderProtocol(a);renderAlert(a.alert||{});}catch(e){document.getElementById('trendHint').textContent='分析データを取得できません';}}
