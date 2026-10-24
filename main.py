@@ -33,6 +33,8 @@ ALTER TABLE events ADD COLUMN IF NOT EXISTS geo_lat DOUBLE PRECISION;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS geo_lon DOUBLE PRECISION;
 CREATE INDEX IF NOT EXISTS events_occurred_at_idx ON events (occurred_at DESC);
 CREATE INDEX IF NOT EXISTS events_type_idx ON events (event_type);
+CREATE INDEX IF NOT EXISTS events_path_idx ON events (path);
+CREATE INDEX IF NOT EXISTS events_status_idx ON events (status_code);
 """
 
 async def open_pool():
@@ -71,6 +73,12 @@ class EventIn(BaseModel):
     status_code: int = Field(default=200, ge=100, le=599)
     tags: list[str] = Field(default_factory=list, max_length=30)
     client_ip: str | None = Field(default=None, max_length=64)
+
+PUBLIC_TAGS = {
+    "ua_claim:search_crawler", "ua_claim:scanner_tool", "ua_claim:automation",
+    "signal:exploit_probe", "signal:common_scan_path", "signal:non_read_method",
+    "assessment:scanner_like",
+}
 
 def classify(event_type: str, path: str, tags: list[str] | None = None) -> str:
     p = path.lower()
@@ -164,6 +172,79 @@ async def summary():
         "intrusion_note": "この囮アプリには実システムへの侵入経路がないため、実侵入の成否は判定できません。"
     }
 
+
+@app.get("/api/dashboard/analytics")
+async def analytics():
+    async with app.state.pool.acquire() as conn:
+        hourly = await conn.fetch("""
+          SELECT buckets.bucket AS hour,
+                 COUNT(e.id) AS total,
+                 COUNT(e.id) FILTER (WHERE e.status_code >= 500) AS errors
+          FROM generate_series(
+            date_trunc('hour', NOW()) - INTERVAL '23 hours',
+            date_trunc('hour', NOW()),
+            INTERVAL '1 hour'
+          ) AS buckets(bucket)
+          LEFT JOIN events e
+            ON e.occurred_at >= buckets.bucket
+           AND e.occurred_at < buckets.bucket + INTERVAL '1 hour'
+           AND e.path <> '/health'
+          GROUP BY buckets.bucket
+          ORDER BY buckets.bucket
+        """)
+        categories = await conn.fetch("""
+          SELECT CASE
+            WHEN event_type = 'fake_shell_access' THEN 'decoy_access'
+            WHEN event_type = 'login_attempt' THEN 'password_attempt'
+            WHEN event_type = 'server_error' THEN 'server_error'
+            WHEN 'ua_claim:search_crawler' = ANY(tags) THEN 'search_crawler'
+            WHEN 'assessment:scanner_like' = ANY(tags) THEN 'scanner_like'
+            WHEN LOWER(path) LIKE '%/admin%' OR LOWER(path) LIKE '%wp-login%'
+              OR LOWER(path) LIKE '%wp-admin%' OR LOWER(path) LIKE '%/.env%'
+              OR LOWER(path) LIKE '%phpmyadmin%' OR LOWER(path) LIKE '%/config%'
+              OR LOWER(path) LIKE '%/backup%' THEN 'admin_probe'
+            WHEN event_type = 'http_request' AND path <> '/health' THEN 'knock'
+            ELSE 'request'
+          END AS category, COUNT(*) AS count
+          FROM events
+          WHERE path <> '/health' AND occurred_at >= NOW() - INTERVAL '24 hours'
+          GROUP BY category
+          ORDER BY count DESC
+        """)
+        paths = await conn.fetch("""
+          SELECT path, COUNT(*) AS count
+          FROM events
+          WHERE path <> '/health' AND occurred_at >= NOW() - INTERVAL '24 hours'
+          GROUP BY path
+          ORDER BY count DESC, path ASC
+          LIMIT 8
+        """)
+        statuses = await conn.fetch("""
+          SELECT status_code, COUNT(*) AS count
+          FROM events
+          WHERE path <> '/health' AND occurred_at >= NOW() - INTERVAL '24 hours'
+          GROUP BY status_code
+          ORDER BY count DESC, status_code ASC
+          LIMIT 8
+        """)
+        totals = await conn.fetchrow("""
+          SELECT
+            COUNT(*) FILTER (WHERE occurred_at >= NOW() - INTERVAL '1 hour') AS last_hour,
+            COUNT(*) FILTER (WHERE status_code >= 500 AND occurred_at >= NOW() - INTERVAL '24 hours') AS errors_24h,
+            COUNT(*) FILTER (WHERE 'assessment:scanner_like' = ANY(tags)
+              AND occurred_at >= NOW() - INTERVAL '24 hours') AS scanner_candidates_24h
+          FROM events WHERE path <> '/health'
+        """)
+    return {
+        "series": [{"hour": r["hour"].isoformat(), "total": r["total"], "errors": r["errors"]} for r in hourly],
+        "categories": [{"category": r["category"], "count": r["count"]} for r in categories],
+        "top_paths": [{"path": r["path"], "count": r["count"]} for r in paths],
+        "statuses": [{"status_code": r["status_code"], "count": r["count"]} for r in statuses],
+        "last_hour": totals["last_hour"],
+        "errors_24h": totals["errors_24h"],
+        "scanner_candidates_24h": totals["scanner_candidates_24h"],
+    }
+
 @app.get("/api/dashboard/geo")
 async def geo_events():
     async with app.state.pool.acquire() as conn:
@@ -211,7 +292,7 @@ async def recent_events(limit: int = 50):
             "method": r["method"],
             "path": r["path"],
             "status_code": r["status_code"],
-            "tags": r["tags"],
+            "tags": [tag for tag in r["tags"] if tag in PUBLIC_TAGS],
         })
     return {"events": result}
 
@@ -235,8 +316,8 @@ h1{font-size:clamp(21px,4vw,30px);margin:0;letter-spacing:.02em}.sub{color:var(-
 section{margin-top:28px}.sectionhead{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}h2{font-size:17px;margin:0}.small{color:var(--muted);font-size:12px}
 .tablewrap{overflow:auto;border:1px solid var(--line);border-radius:12px;background:#0d1523}table{width:100%;border-collapse:collapse;min-width:650px}th,td{text-align:left;padding:12px 14px;border-bottom:1px solid #1d2a3e;font-size:13px}th{color:var(--muted);font-weight:600;background:#111b2c}td.path{font-family:ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}.badge{display:inline-block;border-radius:6px;padding:3px 7px;background:#1a2b41;color:#bdd5f4;font-size:11px}.badge.warn{background:#392819;color:#ffd08a}.badge.fail{background:#3a202b;color:#ff9da5}.empty{color:var(--muted);text-align:center;padding:28px}
 .pathway{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.stage{border:1px solid var(--line);border-radius:10px;padding:14px;background:#0d1523;min-width:0}.stage-num{color:var(--green);font-size:11px;letter-spacing:.08em}.stage-name{font-size:13px;margin:7px 0}.stage-count{font-size:25px;font-weight:750}.stage-arrow{color:#66809f;font-size:12px;margin-top:4px}
-.maplayout{display:grid;grid-template-columns:minmax(0,2fr) minmax(210px,1fr);gap:14px}.mapbox{overflow:hidden;background:radial-gradient(ellipse at center,#12243a,#08111e 78%);border:1px solid var(--line);border-radius:12px;min-height:300px}#worldmap{display:block;width:100%;height:auto;min-height:300px}.land{fill:#244563;stroke:#496b8b;stroke-width:.65;stroke-linejoin:round}.borders{fill:none;stroke:#375673;stroke-width:.48;pointer-events:none}.mapgrid{stroke:#1a2b40;stroke-width:1;fill:none}.geo-point{fill:#59e6aa;stroke:#b8ffe0;stroke-width:1.5;cursor:pointer}.pulse{fill:none;stroke:#59e6aa;stroke-width:2;transform-box:fill-box;transform-origin:center;animation:pulse 2.2s ease-out infinite}.route-line{fill:none;stroke:#70f5ff;stroke-width:2.4;stroke-linecap:round;stroke-dasharray:1;stroke-dashoffset:1;filter:drop-shadow(0 0 4px #4cecff);animation:route-flight 1.15s cubic-bezier(.2,.75,.2,1) forwards}.route-core{fill:none;stroke:#e6ffff;stroke-width:1;stroke-linecap:round;stroke-dasharray:1;stroke-dashoffset:1;animation:route-flight 1.15s cubic-bezier(.2,.75,.2,1) forwards}.honeypot-target{fill:#ffcf70;stroke:#fff0c4;stroke-width:2;filter:drop-shadow(0 0 7px #ffb547)}.target-ring{fill:none;stroke:#ffcf70;stroke-width:1.6;transform-box:fill-box;transform-origin:center;animation:pulse 1.8s ease-out infinite}.target-label{fill:#ffdf9b;font:700 13px system-ui,sans-serif;paint-order:stroke;stroke:#08111e;stroke-width:4px;stroke-linejoin:round}@keyframes route-flight{0%{stroke-dashoffset:1;opacity:.25}12%{opacity:1}88%{opacity:1}100%{stroke-dashoffset:0;opacity:0}}@keyframes pulse{0%{opacity:.9;transform:scale(.4)}100%{opacity:0;transform:scale(3.8)}}.countrylist{display:flex;flex-direction:column;gap:8px}.countryrow{display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid var(--line);padding:8px 0;font-size:13px}.countryrow b{color:var(--green)}footer{margin-top:28px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
-@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.pathway{grid-template-columns:repeat(2,minmax(0,1fr))}.maplayout{grid-template-columns:1fr}}@media(max-width:480px){main{padding:20px 12px 36px}.grid{gap:9px}.card{padding:13px}.top{align-items:flex-start}.live{font-size:11px}}
+.maplayout{display:grid;grid-template-columns:minmax(0,2fr) minmax(210px,1fr);gap:14px}.mapbox{overflow:hidden;background:radial-gradient(ellipse at center,#12243a,#08111e 78%);border:1px solid var(--line);border-radius:12px;min-height:300px}#worldmap{display:block;width:100%;height:auto;min-height:300px}.land{fill:#244563;stroke:#496b8b;stroke-width:.65;stroke-linejoin:round}.borders{fill:none;stroke:#375673;stroke-width:.48;pointer-events:none}.mapgrid{stroke:#1a2b40;stroke-width:1;fill:none}.geo-point{fill:#59e6aa;stroke:#b8ffe0;stroke-width:1.5;cursor:pointer}.pulse{fill:none;stroke:#59e6aa;stroke-width:2;transform-box:fill-box;transform-origin:center;animation:pulse 2.2s ease-out infinite}.route-line{fill:none;stroke:#70f5ff;stroke-width:2.4;stroke-linecap:round;stroke-dasharray:1;stroke-dashoffset:1;filter:drop-shadow(0 0 4px #4cecff);animation:route-flight 1.15s cubic-bezier(.2,.75,.2,1) forwards}.route-core{fill:none;stroke:#e6ffff;stroke-width:1;stroke-linecap:round;stroke-dasharray:1;stroke-dashoffset:1;animation:route-flight 1.15s cubic-bezier(.2,.75,.2,1) forwards}.honeypot-target{fill:#ffcf70;stroke:#fff0c4;stroke-width:2;filter:drop-shadow(0 0 7px #ffb547)}.target-ring{fill:none;stroke:#ffcf70;stroke-width:1.6;transform-box:fill-box;transform-origin:center;animation:pulse 1.8s ease-out infinite}.target-label{fill:#ffdf9b;font:700 13px system-ui,sans-serif;paint-order:stroke;stroke:#08111e;stroke-width:4px;stroke-linejoin:round}@keyframes route-flight{0%{stroke-dashoffset:1;opacity:.25}12%{opacity:1}88%{opacity:1}100%{stroke-dashoffset:0;opacity:0}}@keyframes pulse{0%{opacity:.9;transform:scale(.4)}100%{opacity:0;transform:scale(3.8)}}.countrylist{display:flex;flex-direction:column;gap:8px}.countryrow{display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid var(--line);padding:8px 0;font-size:13px}.countryrow b{color:var(--green)}.analytics-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(260px,1fr);gap:14px}.chartbox{background:#0b1422;border:1px solid var(--line);border-radius:12px;padding:12px;min-width:0}.chart-svg{width:100%;height:auto;display:block}.chart-grid{stroke:#20314a;stroke-width:1}.chart-line{fill:none;stroke:#59e6ff;stroke-width:3;stroke-linejoin:round;stroke-linecap:round;filter:drop-shadow(0 0 5px #1da7c7)}.chart-area{fill:url(#trendFill)}.chart-label{fill:#91a2bb;font:11px system-ui,sans-serif}.metric-strip{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:14px}.metric-mini{background:#0c1524;border:1px solid var(--line);border-radius:10px;padding:13px}.metric-mini .value{font-size:25px;margin:4px 0}.rank-list{display:flex;flex-direction:column;gap:10px}.rank-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;font-size:12px}.rank-name{overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,monospace}.rank-count{color:var(--green);font-weight:700}.rank-track{grid-column:1/3;height:5px;background:#1c2b40;border-radius:99px;overflow:hidden}.rank-fill{height:100%;background:linear-gradient(90deg,#3c9bba,#59e6aa);border-radius:99px}.category-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:12px}.category-row b{color:var(--amber)}footer{margin-top:28px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.pathway{grid-template-columns:repeat(2,minmax(0,1fr))}.maplayout,.analytics-grid{grid-template-columns:1fr}}@media(max-width:480px){.metric-strip{grid-template-columns:1fr}.chartbox{padding:8px}}@media(max-width:480px){main{padding:20px 12px 36px}.grid{gap:9px}.card{padding:13px}.top{align-items:flex-start}.live{font-size:11px}}
 </style></head><body><main>
 <header class="top"><div class="brand"><div class="mark">H</div><div><h1>MK Honeypot</h1><div class="sub">PUBLIC SECURITY OBSERVABILITY · LIVE EVENT FEED</div></div></div><div class="live">● 公開モニター</div></header>
 <div class="notice">公開観測ダッシュボードです。IPアドレス・生のUser-Agent・認証情報は表示しません。地図は位置情報を約10度単位で集約し、複数イベントがある領域のみ表示します。「スキャナー候補」などの分類はアクセスパターンに基づく推定で、発信元の身元を確認したものではありません。アクセスの観測は侵入成功を意味しません。</div>
@@ -246,6 +327,21 @@ section{margin-top:28px}.sectionhead{display:flex;align-items:baseline;justify-c
 <article class="card"><div class="label">管理画面の探索</div><div class="value red" id="probes">—</div><div class="hint">管理・既知パスへのアクセス</div></article>
 <article class="card"><div class="label">直近24時間のイベント</div><div class="value green" id="last24">—</div><div class="hint">保存された全イベント</div></article>
 </div>
+
+<section><div class="sectionhead"><h2>リアルタイム分析</h2><span class="small">直近24時間 · 1時間単位 · 5秒ごとに更新</span></div>
+<div class="metric-strip">
+<div class="metric-mini"><div class="label">直近1時間</div><div class="value green" id="lastHour">—</div><div class="hint">リクエスト数</div></div>
+<div class="metric-mini"><div class="label">サーバーエラー</div><div class="value red" id="errors24">—</div><div class="hint">直近24時間 · HTTP 5xx</div></div>
+<div class="metric-mini"><div class="label">スキャナー候補</div><div class="value amber" id="scanner24">—</div><div class="hint">直近24時間 · 推定分類</div></div>
+</div>
+<div class="analytics-grid">
+<div class="card"><div class="sectionhead"><h2>アクセス推移</h2><span class="small">時間別</span></div><div class="chartbox"><svg id="trendChart" class="chart-svg" viewBox="0 0 760 250" role="img" aria-label="直近24時間の時間別アクセス数のグラフ"><defs><linearGradient id="trendFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#59e6ff" stop-opacity=".3"/><stop offset="100%" stop-color="#59e6ff" stop-opacity="0"/></linearGradient></defs><g id="trendGrid"></g><path id="trendArea" class="chart-area" d=""></path><polyline id="trendLine" class="chart-line" points=""></polyline><g id="trendPoints"></g><g id="trendLabels"></g></svg></div><div class="hint" id="trendHint">データを読み込んでいます…</div></div>
+<div class="card"><div class="sectionhead"><h2>分類別イベント</h2><span class="small">24時間</span></div><div id="categoryList" class="rank-list"><div class="empty">集計を読み込んでいます…</div></div><div class="hint" style="margin-top:12px">分類はアクセスパターンに基づく推定です。発信者の身元や意図を確定するものではありません。</div></div>
+</div>
+<div class="analytics-grid" style="margin-top:14px">
+<div class="card"><div class="sectionhead"><h2>アクセスされたパス TOP 8</h2><span class="small">24時間 · クエリ除外</span></div><div id="pathRanking" class="rank-list"><div class="empty">集計を読み込んでいます…</div></div></div>
+<div class="card"><div class="sectionhead"><h2>HTTPステータス</h2><span class="small">24時間</span></div><div id="statusRanking" class="rank-list"><div class="empty">集計を読み込んでいます…</div></div></div>
+</div></section>
 <section><div class="sectionhead"><h2>侵入状況</h2><span class="small">判定の限界</span></div><div class="card"><div class="value amber" style="font-size:20px">実侵入：判定対象外</div><div class="hint" id="intrusionNote">この囮アプリは本物の内部システムを公開していないため、実侵入の成功を判定できません。</div></div></section>
 <section><div class="sectionhead"><h2>アクセス元マップ</h2><span class="small">約10度単位の集約位置・5秒ごとに更新</span></div>
 <div class="maplayout"><div class="mapbox"><svg id="worldmap" viewBox="0 0 1000 500" role="img" aria-label="アクセス元の概算位置を示す世界地図">
@@ -267,13 +363,19 @@ section{margin-top:28px}.sectionhead{display:flex;align-items:baseline;justify-c
 let mapProjection=null;
 async function initWorldMap(){try{const r=await fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json",{cache:"force-cache"});if(!r.ok)throw Error("map data");const world=await r.json();const features=topojson.feature(world,world.objects.countries).features;mapProjection=d3.geoNaturalEarth1().fitExtent([[12,12],[988,488]],{type:"FeatureCollection",features});const path=d3.geoPath(mapProjection);const land=document.getElementById("world-land");land.replaceChildren();for(const feature of features){const p=document.createElementNS("http://www.w3.org/2000/svg","path");p.setAttribute("d",path(feature));p.setAttribute("class","land");land.append(p)}const borders=document.getElementById("country-borders");borders.setAttribute("d",path(topojson.mesh(world,world.objects.countries,(a,b)=>a!==b)));}catch(e){document.getElementById("worldmap").setAttribute("aria-label","世界地図データを読み込めませんでした。アクセス地点のみ表示します。")}}
 const fmtTime=s=>{try{return new Date(s).toISOString().replace('T',' ').slice(0,19)}catch{return s||'—'}};
-const label=c=>({http_request:'ノック / HTTP',login_attempt:'パスワード試行',server_error:'サーバーエラー',admin_probe:'管理画面探索',password_attempt:'パスワード試行',knock:'ノック / HTTP',request:'リクエスト',search_crawler:'検索クローラー候補',scanner_like:'スキャナー候補'}[c]||c);
+const label=c=>({http_request:'ノック / HTTP',login_attempt:'パスワード試行',server_error:'サーバーエラー',admin_probe:'管理画面探索',password_attempt:'パスワード試行',knock:'通常HTTPアクセス',request:'リクエスト',search_crawler:'検索クローラー候補',scanner_like:'スキャナー候補',decoy_access:'囮コンソールアクセス'}[c]||c);
 const badge=c=>c==='login_attempt'||c==='password_attempt'||c==='search_crawler'?'warn':c==='server_error'||c==='admin_probe'||c==='scanner_like'?'fail':'';
 function project(lon,lat){if(mapProjection){const q=mapProjection([lon,lat]);return {x:q[0],y:q[1]}}return {x:(lon+180)/360*1000,y:(90-lat)/180*500}}
 const honeypotLocation={lon:-122.4,lat:37.8,label:'MK Honeypot · SFO'};
 let geoSeenCounts=null;
 function drawHoneypotTarget(){const layer=document.getElementById('honeypot-target');layer.replaceChildren();const q=project(honeypotLocation.lon,honeypotLocation.lat);const ns='http://www.w3.org/2000/svg';const ring=document.createElementNS(ns,'circle');ring.setAttribute('cx',q.x);ring.setAttribute('cy',q.y);ring.setAttribute('r','7');ring.setAttribute('class','target-ring');layer.append(ring);const dot=document.createElementNS(ns,'circle');dot.setAttribute('cx',q.x);dot.setAttribute('cy',q.y);dot.setAttribute('r','5');dot.setAttribute('class','honeypot-target');layer.append(dot);const label=document.createElementNS(ns,'text');label.setAttribute('x',q.x+10);label.setAttribute('y',q.y-10);label.setAttribute('class','target-label');label.textContent=honeypotLocation.label;layer.append(label)}
 function animateRoute(from){const to=project(honeypotLocation.lon,honeypotLocation.lat);if(Math.hypot(from.x-to.x,from.y-to.y)<8)return;const ns='http://www.w3.org/2000/svg';const layer=document.getElementById('geo-routes');const path=document.createElementNS(ns,'path');const mx=(from.x+to.x)/2,my=(from.y+to.y)/2;const dx=to.x-from.x,dy=to.y-from.y;const bend=Math.min(90,Math.max(22,Math.hypot(dx,dy)*.16));const sign=from.x<to.x?-1:1;const d='M '+from.x+' '+from.y+' Q '+(mx)+' '+(my-bend*sign)+' '+to.x+' '+to.y;path.setAttribute('d',d);path.setAttribute('pathLength','1');path.setAttribute('class','route-line');layer.append(path);const core=document.createElementNS(ns,'path');core.setAttribute('d',d);core.setAttribute('pathLength','1');core.setAttribute('class','route-core');layer.append(core);setTimeout(()=>{path.remove();core.remove()},1400)}
+
+
+function renderRankList(id,items,nameFn,countFn,colorClass=''){const root=document.getElementById(id);root.replaceChildren();if(!items.length){const e=document.createElement('div');e.className='empty';e.textContent='該当データはありません';root.append(e);return}const max=Math.max(1,...items.map(x=>Number(countFn(x))||0));for(const item of items){const row=document.createElement('div');row.className='rank-row';const name=document.createElement('span');name.className='rank-name';name.textContent=nameFn(item);const count=document.createElement('span');count.className='rank-count '+colorClass;count.textContent=Number(countFn(item)).toLocaleString();const track=document.createElement('div');track.className='rank-track';const fill=document.createElement('div');fill.className='rank-fill';fill.style.width=(Number(countFn(item))/max*100)+'%';track.append(fill);row.append(name,count,track);root.append(row)}}
+function renderCategories(items){const root=document.getElementById('categoryList');root.replaceChildren();if(!items.length){const e=document.createElement('div');e.className='empty';e.textContent='直近24時間のイベントはありません';root.append(e);return}for(const item of items){const row=document.createElement('div');row.className='category-row';const name=document.createElement('span');name.textContent=label(item.category);const count=document.createElement('b');count.textContent=Number(item.count).toLocaleString();row.append(name,count);root.append(row)}}
+function renderTrend(series){const W=760,H=250,left=38,right=16,top=18,bottom=36,plotW=W-left-right,plotH=H-top-bottom;const vals=series.map(x=>Number(x.total)||0),max=Math.max(4,...vals);const pts=series.map((x,i)=>({x:left+(series.length<2?0:i*plotW/(series.length-1)),y:top+plotH-(Number(x.total)||0)/max*plotH,v:Number(x.total)||0}));const grid=document.getElementById('trendGrid');grid.replaceChildren();for(let i=0;i<=4;i++){const y=top+i*plotH/4;const line=document.createElementNS('http://www.w3.org/2000/svg','line');line.setAttribute('x1',left);line.setAttribute('x2',W-right);line.setAttribute('y1',y);line.setAttribute('y2',y);line.setAttribute('class','chart-grid');grid.append(line);const t=document.createElementNS('http://www.w3.org/2000/svg','text');t.setAttribute('x',left-8);t.setAttribute('y',y+4);t.setAttribute('text-anchor','end');t.setAttribute('class','chart-label');t.textContent=Math.round(max*(4-i)/4);grid.append(t)}const poly=pts.map(p=>p.x+','+p.y).join(' ');document.getElementById('trendLine').setAttribute('points',poly);document.getElementById('trendArea').setAttribute('d',pts.length?'M '+pts[0].x+' '+(top+plotH)+' L '+pts.map(p=>p.x+' '+p.y).join(' L ')+' L '+pts[pts.length-1].x+' '+(top+plotH)+' Z':'');const pg=document.getElementById('trendPoints');pg.replaceChildren();for(let i=0;i<pts.length;i++){const p=pts[i];const dot=document.createElementNS('http://www.w3.org/2000/svg','circle');dot.setAttribute('cx',p.x);dot.setAttribute('cy',p.y);dot.setAttribute('r','3');dot.setAttribute('fill','#d7fbff');const title=document.createElementNS('http://www.w3.org/2000/svg','title');title.textContent=fmtTime(series[i].hour)+' UTC · '+p.v+' events';dot.append(title);pg.append(dot)}const labels=document.getElementById('trendLabels');labels.replaceChildren();for(const i of [0,Math.floor((series.length-1)/3),Math.floor(2*(series.length-1)/3),series.length-1]){if(!series[i])continue;const t=document.createElementNS('http://www.w3.org/2000/svg','text');t.setAttribute('x',pts[i].x);t.setAttribute('y',H-10);t.setAttribute('text-anchor',i===0?'start':i===series.length-1?'end':'middle');t.setAttribute('class','chart-label');t.textContent=new Date(series[i].hour).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit',timeZone:'UTC'});labels.append(t)}const total=vals.reduce((a,b)=>a+b,0);document.getElementById('trendHint').textContent='直近24時間の合計 '+total.toLocaleString()+' 件 · 時刻はUTC表示';}
+async function refreshAnalytics(){try{const r=await fetch('/api/dashboard/analytics',{cache:'no-store'});if(!r.ok)throw Error('analytics api');const a=await r.json();document.getElementById('lastHour').textContent=Number(a.last_hour).toLocaleString();document.getElementById('errors24').textContent=Number(a.errors_24h).toLocaleString();document.getElementById('scanner24').textContent=Number(a.scanner_candidates_24h).toLocaleString();renderTrend(a.series||[]);renderCategories(a.categories||[]);renderRankList('pathRanking',a.top_paths||[],x=>x.path,x=>x.count);renderRankList('statusRanking',a.statuses||[],x=>'HTTP '+x.status_code,x=>x.count);}catch(e){document.getElementById('trendHint').textContent='分析データを取得できません';}}
 
 async function refreshGeo(){try{
  const r=await fetch('/api/dashboard/geo',{cache:'no-store'});if(!r.ok)throw Error('geo api');
@@ -303,5 +405,5 @@ async function refresh(){try{
  for(const ev of b.events){const tr=document.createElement('tr');const vals=[fmtTime(ev.timestamp),label(ev.category),ev.method,ev.path,String(ev.status_code),(ev.tags||[]).join(', ')||'—'];vals.forEach((v,i)=>{const td=document.createElement('td');td.textContent=v;if(i===3)td.className='path';if(i===1){const span=document.createElement('span');span.className='badge '+badge(ev.category);span.textContent=v;td.replaceChildren(span)}tr.append(td)});body.append(tr)}
  document.getElementById('updated').textContent='最終更新 '+new Date().toLocaleTimeString('ja-JP');
  }catch(e){document.getElementById('updated').textContent='取得エラー';}}
-initWorldMap().then(()=>{drawHoneypotTarget();refreshGeo()});refresh();refreshGeo();setInterval(refresh,5000);setInterval(refreshGeo,5000);
+initWorldMap().then(()=>{drawHoneypotTarget();refreshGeo()});refresh();refreshGeo();refreshAnalytics();setInterval(refresh,5000);setInterval(refreshGeo,5000);setInterval(refreshAnalytics,5000);
 </script></body></html>"""
